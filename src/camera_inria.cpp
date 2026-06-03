@@ -232,6 +232,17 @@ void alignViewZ(Mat4& V, const Mat4& V_osg, double cx, double cy, double cz) {
     }
 }
 
+void eyeWorldFromOsgView(const Mat4& V_raw, float out[3]) {
+    Mat4 inv;
+    if (!V_raw.invert(inv)) {
+        out[0] = out[1] = out[2] = 0.f;
+        return;
+    }
+    out[0] = static_cast<float>(inv(3, 0));
+    out[1] = static_cast<float>(inv(3, 1));
+    out[2] = static_cast<float>(inv(3, 2));
+}
+
 void camPosFromView(const float view_cm[16], float out[3]) {
     Mat4 M;
     for (int c = 0; c < 4; ++c) {
@@ -262,8 +273,8 @@ SceneMats makeScene(const double eye[3], const double center[3], const double up
     s.fovY = fovY;
     s.fovX = 2.0 * std::atan(std::tan(fovY * 0.5) * aspect);
     Mat4 V = lookAt(eye, center, up);
-    const Mat4 V_osg = V;
-    alignViewZ(V, V_osg, ref_center[0], ref_center[1], ref_center[2]);
+    (void)ref_center;
+    // LookAt 路径直接使用几何定义的 V，避免启发式 Z 翻转造成镜像/拉伸。
     s.V = V;
     s.proj_gl = perspectiveGl(fovY, aspect, znear, zfar);
     s.P_inria = projectionInria(znear, zfar, s.fovX, s.fovY);
@@ -315,11 +326,84 @@ void applyMode(const SceneMats& scene, ViewPack vp, ProjPack pp, bool proj_mul_p
     out.tan_fovy = static_cast<float>(std::tan(scene.fovY * 0.5));
 }
 
+Mat4 mat4FromArray(const double m[16]) {
+    Mat4 M;
+    std::memcpy(M.m, m, sizeof(M.m));
+    return M;
+}
+
+// Match 3dgs-osg-viewer fovFromOsgProjection (OSG uses OpenGL perspective: P(3,2)=-1).
+bool fovFromOsgPerspective(const Mat4& proj, double& fovX, double& fovY, double& znear, double& zfar) {
+    znear = 0.01;
+    zfar = 10000.0;
+    const double sy = std::abs(proj(1, 1));
+    if (sy < 1e-9) return false;
+    fovY = 2.0 * std::atan(1.0 / sy);
+    const double sx = std::abs(proj(0, 0));
+    if (sx < 1e-9) return false;
+    // OpenGL perspective: m00=1/(aspect*tan(fovy/2)), m11=1/tan(fovy/2)
+    // => tan(fovx/2) = aspect*tan(fovy/2) = (m11/m00)*tan(fovy/2).
+    fovX = 2.0 * std::atan((sy / sx) * std::tan(fovY * 0.5));
+    const double m22 = proj(2, 2);
+    const double m23 = proj(2, 3);
+    const double m32 = proj(3, 2);
+    if (std::abs(m32 + 1.0) < 0.05) {
+        zfar = m23 / (m22 + 1.0);
+        znear = m23 / (m22 - 1.0);
+        if (znear > zfar) std::swap(znear, zfar);
+        if (znear <= 0 || zfar <= znear || !std::isfinite(znear) || !std::isfinite(zfar)) {
+            znear = 0.01;
+            zfar = 10000.0;
+        }
+    }
+    return std::isfinite(fovX) && std::isfinite(fovY) && fovX > 0 && fovY > 0;
+}
+
+struct OsgScene {
+    Mat4 V;
+    Mat4 V_raw;
+    Mat4 proj_gl;
+    Mat4 P_inria_pure;
+    double fovX = 0;
+    double fovY = 0;
+    double znear = 0.01;
+    double zfar = 10000.0;
+};
+
+OsgScene makeOsgScene(const double view_osg[16], const double proj_osg[16], const double ref_center[3]) {
+    OsgScene s;
+    s.V_raw = mat4FromArray(view_osg);
+    s.proj_gl = mat4FromArray(proj_osg);
+    (void)ref_center;
+    // OSG 路径直接使用当前帧原始 view，避免额外启发式改写。
+    s.V = s.V_raw;
+    if (!fovFromOsgPerspective(s.proj_gl, s.fovX, s.fovY, s.znear, s.zfar)) {
+        s.fovY = 60.0 * 3.14159265358979323846 / 180.0;
+        s.fovX = s.fovY;
+        s.znear = 0.01;
+        s.zfar = 10000.0;
+    }
+    // Same as 3dgs buildCudaMatrices: pure Inria P from FOV, not patched OSG rows.
+    s.P_inria_pure = projectionInria(s.znear, s.zfar, s.fovX, s.fovY);
+    return s;
+}
+
+/** Inria diff-gaussian-rasterization: view=world→cam, proj=world→clip (V * P_inria, Z in [0,1]). */
+void buildOsgCameraInria(const OsgScene& scene, LookAtMats& out) {
+    packInria(scene.V, out.view);
+    packInria(scene.V * scene.P_inria_pure, out.proj);
+    eyeWorldFromOsgView(scene.V_raw, out.cam_pos);
+    if (std::fabs(out.cam_pos[0]) < 1e-6f && std::fabs(out.cam_pos[1]) < 1e-6f &&
+        std::fabs(out.cam_pos[2]) < 1e-6f) {
+        camPosFromView(out.view, out.cam_pos);
+    }
+    out.tan_fovx = static_cast<float>(std::tan(scene.fovX * 0.5));
+    out.tan_fovy = static_cast<float>(std::tan(scene.fovY * 0.5));
+}
+
 }  // namespace
 
-int defaultMatMode() { return encodeMode(ViewPack::Inria, ProjPack::InriaVP); }
-int matModeInriaGlClip() { return encodeMode(ViewPack::Inria, ProjPack::GlClip); }
-int matModeInriaFullProj() { return encodeMode(ViewPack::Inria, ProjPack::InriaVP); }
+int defaultMatMode() { return encodeMode(ViewPack::Inria, ProjPack::GlClip); }
 
 void matsToCamera(const LookAtMats& mats, Camera& out) {
     std::memcpy(out.view, mats.view, sizeof(out.view));
@@ -349,17 +433,18 @@ void pickMatMode(const double eye[3], const double center[3], const double up[3]
         ProjPack pp;
         bool mul_pv;
     };
+    // Match 3dgs-osg-viewer probing order: try GL view + GL clip first.
     const Cand cands[] = {
-        {ViewPack::Inria, ProjPack::InriaVP, false},
-        {ViewPack::Inria, ProjPack::GlClip, false},
-        {ViewPack::Inria, ProjPack::InriaClip, false},
         {ViewPack::Gl, ProjPack::GlClip, false},
+        {ViewPack::Inria, ProjPack::GlClip, false},
+        {ViewPack::Inria, ProjPack::InriaVP, false},
+        {ViewPack::Inria, ProjPack::InriaClip, false},
         {ViewPack::Inria, ProjPack::InriaVP, true},
         {ViewPack::Gl, ProjPack::InriaVP, false},
     };
 
     int best = -1;
-    int best_mode = encodeMode(ViewPack::Inria, ProjPack::InriaVP);
+    int best_mode = encodeMode(ViewPack::Gl, ProjPack::GlClip);
     bool best_mul = false;
 
     for (const Cand& c : cands) {
@@ -385,6 +470,12 @@ void pickMatMode(const double eye[3], const double center[3], const double up[3]
               best_mul, out);
     std::cout << "CUDA camera: picked " << viewName(static_cast<ViewPack>(best_mode / 16)) << " + "
               << projName(static_cast<ProjPack>(best_mode % 16)) << " (NDC~=" << best << ")\n";
+}
+
+void buildOsgMats(const double view_osg[16], const double proj_osg[16], const double ref_center[3],
+                  LookAtMats& out) {
+    const OsgScene scene = makeOsgScene(view_osg, proj_osg, ref_center);
+    buildOsgCameraInria(scene, out);
 }
 
 }  // namespace internal

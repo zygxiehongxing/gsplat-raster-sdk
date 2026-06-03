@@ -2,7 +2,7 @@
 
 /**
  * gsplat-raster-sdk — Inria diff-gaussian-rasterization wrapper (no OSG).
- * Input: Gaussian arrays (or PLY) + camera.
+ * Input: Gaussian arrays + camera.
  * Output: RGB buffer or PNG file.
  */
 
@@ -13,16 +13,10 @@
 
 namespace gsplat {
 
+/// 每个高斯的 SH 系数总长度（DC + 其余阶）。
 constexpr int kShCoeffs = 48;
 
-struct PlyLoadOptions {
-    size_t max_points = 0;
-    float min_opacity = 0.005f;
-    bool drop_sh_rest = false;
-    /** When max_points > 0: stride-read entire PLY (fast scan). false = reservoir sample (slower, uniform). */
-    bool stride_subsample = false;
-};
-
+/// SDK 使用的单个高斯点数据结构。
 struct Gaussian {
     float x = 0, y = 0, z = 0;
     float opacity_logit = 0.f;
@@ -32,20 +26,16 @@ struct Gaussian {
     bool has_sh_rest = false;
 };
 
-/** Background RGB in [0,1]. */
+/// 渲染参数（背景色、缩放倍率、是否仅用 DC 颜色）。
 struct RenderSettings {
     float background[3] = {0.02f, 0.02f, 0.06f};
     float scale_modifier = 1.f;
     bool dc_only = false;
 };
 
-/**
- * Camera for Inria rasterizer.
- * Use buildCameraLookAt() or fill view/proj/cam_pos/tan_fov yourself (training export).
- *
- * view, proj: column-major 4x4 (same packing as Inria CUDA kernels).
- * cam_pos: world-space camera position (3 floats).
- */
+/// Inria 光栅器相机输入。
+/// - view/proj: 列主序 4x4（与 CUDA kernel 一致）
+/// - cam_pos: 世界坐标相机位置
 struct Camera {
     float view[16] = {};
     float proj[16] = {};
@@ -60,48 +50,51 @@ enum class Status {
     ErrorNoGaussians,
     ErrorInvalidArgs,
     ErrorRenderFailed,
-    ErrorPlyLoad,
     ErrorPngWrite,
 };
 
+/// 状态码转可读字符串。
 const char* statusString(Status s);
 
-/** True if CUDA device and CudaRasterizer were linked. */
+/// 检查 CUDA 设备与光栅内核是否可用。
 bool isCudaAvailable();
 
-bool loadGaussianPly(const std::string& path, std::vector<Gaussian>& out,
-                     const PlyLoadOptions& opts = {});
+/// 重置 CUDA 上下文（CLI 多次运行时可释放显存状态）。
+void resetCudaDevice();
 
+/// SDK 光栅器封装类：管理高斯上传与 CUDA 渲染调用。
 class Rasterizer {
 public:
+    /// 构造光栅器实例。
     Rasterizer();
+    /// 析构并释放关联资源。
     ~Rasterizer();
 
     Rasterizer(const Rasterizer&) = delete;
     Rasterizer& operator=(const Rasterizer&) = delete;
 
+    /// 设置渲染参数（背景、scale_modifier、dc_only）。
     void setSettings(const RenderSettings& s);
+    /// 获取当前渲染参数副本。
     RenderSettings settings() const;
 
-    Status setGaussians(const std::vector<Gaussian>& gaussians);
-    Status loadPly(const std::string& path, const PlyLoadOptions& opts = {});
-
+    /// 上传高斯数组到 GPU。
+    Status setGaussians(std::vector<Gaussian> gaussians);
+    /// 当前已上传高斯数量。
     int numGaussians() const;
+    /// 最近一次渲染统计到的可见高斯数量。
     int lastVisibleCount() const;
 
-    /**
-     * Render to RGB8 row-major, size = width * height * 3.
-     * Returns Ok even when 0 splats visible (background fill).
-     */
+    /// 渲染到 RGB8 缓冲区（行优先）。
     Status render(const Camera& cam, int width, int height, std::vector<uint8_t>& out_rgb);
 
-    /** render() then write PNG (8-bit RGB). */
+    /// 渲染并直接写出 PNG（8-bit RGB）。
     Status renderToPng(const Camera& cam, int width, int height, const std::string& png_path);
 
-    /** Sample how many gaussians pass Inria frustum (approximate). */
+    /// 估算有多少高斯通过当前相机视锥（采样近似）。
     int countFrustumPass(const Camera& cam, int max_samples = 8192) const;
 
-    /** Quick low-res render to count visible splats (for matrix tuning). */
+    /// 低分辨率快速渲染并返回可见 splat 数量（调参与诊断用）。
     int probeVisibleSplats(const Camera& cam, int width = 640, int height = 360) const;
 
 private:
@@ -109,13 +102,14 @@ private:
     Impl* impl_;
 };
 
-/**
- * Build Inria-compatible view/proj (official V*P_inria + auto matrix pick).
- * If raster_for_pick has gaussians, probes packing modes and picks best NDC pass.
- */
+/// 通过 eye/center/up 构建 Inria 约定相机矩阵。
 void buildCameraLookAt(const double eye[3], const double center[3], const double up[3],
                        double fov_y_deg, double aspect, double znear, double zfar,
                        const double ref_center[3], Camera& out,
                        Rasterizer* raster_for_pick = nullptr);
+
+/// 将 OSG 的 view/proj（row-major）转换为 Inria 相机输入。
+void buildCameraFromOsg(const double view_osg[16], const double proj_osg[16],
+                        const double ref_center[3], Camera& out);
 
 }  // namespace gsplat

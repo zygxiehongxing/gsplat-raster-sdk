@@ -1,11 +1,35 @@
 # gsplat-raster-sdk
 
-Standalone SDK wrapping [Inria diff-gaussian-rasterization](https://github.com/graphdeco-inria/diff-gaussian-rasterization).
+**SDK 层**：根据 App（或 CLI）传入的**相机参数**与**高斯点云**，执行 Inria CUDA 光栅化并输出图像。本仓库**不包含** OSG、窗口或交互逻辑。
 
-**Input:** 3D Gaussian Splatting PLY (or `Gaussian` arrays) + camera  
+Standalone CUDA raster SDK wrapping [Inria diff-gaussian-rasterization](https://github.com/graphdeco-inria/diff-gaussian-rasterization).
+
+Application-side viewer/CLI lives in a sibling project:
+
+- `../gsplat-raster-app` — PLY 加载、OSG 可视化、交互时把当前帧相机 + 高斯传给本 SDK
+
+## 职责划分
+
+| 层 | 仓库 | 做什么 |
+|----|------|--------|
+| App | `gsplat-raster-app` | PLY / OSG / 交互；组装 `Camera` + `Gaussian` 并调用 SDK |
+| SDK | `gsplat-raster-sdk`（本仓库） | `Rasterizer::render` / `renderToPng`；矩阵打包与 CUDA 内核 |
+
+```text
+  App ── Camera, width, height, RenderSettings ──► Rasterizer
+        Gaussians (setGaussians / loadPly)
+                      │
+                      ▼
+              diff-gaussian-rasterization (CUDA)
+                      │
+                      ▼
+              RGB8 buffer 或 PNG 文件
+```
+
+**Input:** `Gaussian` 数组（或 PLY 经 `loadPly`）+ `Camera`（`view` / `proj` / `cam_pos` / `tan_fov`）  
 **Output:** RGB buffer or PNG  
 
-No OpenSceneGraph. Suitable as a shared library for other apps (viewers, pipelines, services).
+No OSG dependency in this repository.
 
 ## Dependencies
 
@@ -35,7 +59,7 @@ Configure with:
 cmake -B build -DGSPLAT_DGR_ROOT=/path/to/diff-gaussian-rasterization
 ```
 
-## Build (Windows)
+## Build SDK (Windows)
 
 ```cmd
 cd gsplat-raster-sdk
@@ -44,16 +68,9 @@ scripts\build.cmd
 
 Produces:
 
-- `build/Release/gsplat_raster.lib` (static library)
-- `build/Release/gsplat_render_ply.exe` (example)
+- `build/sdk/gsplat_raster.lib` (SDK static library)
 
-## Quick start (CLI)
-
-```cmd
-gsplat_render_ply point_cloud.ply out.png 1280 720 500000
-```
-
-Arguments: `ply`, `png`, optional `width`, `height`, `max_points` (0 = all).
+Use `../gsplat-raster-app` for CLI rendering and OSG roaming app.
 
 ## API overview
 
@@ -66,18 +83,15 @@ Namespace: `gsplat`
 if (!gsplat::isCudaAvailable()) { /* no GPU */ }
 ```
 
-### 2. Load gaussians
+### 2. Prepare gaussians
 
 ```cpp
 std::vector<gsplat::Gaussian> G;
-gsplat::PlyLoadOptions opts;
-opts.max_points = 500000;   // subsample large clouds
-opts.drop_sh_rest = false;  // true = DC-only (faster, lower quality)
-
 gsplat::Rasterizer raster;
-gsplat::Status st = raster.loadPly("scene.ply", opts);
-// or: raster.setGaussians(G);
+gsplat::Status st = raster.setGaussians(std::move(G));
 ```
+
+> SDK 仅负责光栅化，不再包含 PLY 读取逻辑；PLY 解析由 app 侧负责。
 
 ### 3. Camera
 
@@ -107,8 +121,15 @@ cam.tan_fovx = ...;
 cam.tan_fovy = ...;
 ```
 
-Matrix layout matches Inria CUDA (`viewmatrix` / `projmatrix` in `Rasterizer::forward`).  
-Default helper uses **Inria-packed view** + **GL clip `proj * view`** (same as `3dgs-osg-viewer` stable path).
+Matrix layout matches Inria CUDA (`viewmatrix` / `projmatrix` in `Rasterizer::forward`).
+
+**Option C — OSG `view` / `proj` matrices (row-major 16 doubles, `osg::Matrix` layout):**
+
+```cpp
+gsplat::buildCameraFromOsg(view_osg, proj_osg, ref_center, cam);
+```
+
+Used by `gsplat-raster-app` so SDK output matches the OSG camera.
 
 ### 4. Render settings
 

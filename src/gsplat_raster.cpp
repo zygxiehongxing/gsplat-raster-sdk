@@ -2,7 +2,6 @@
 
 #include "camera_inria_internal.h"
 #include "internal/rasterizer_impl.h"
-#include "ply_loader.h"
 #include "png_write.h"
 
 #include <cstring>
@@ -26,13 +25,17 @@ const char* statusString(Status s) {
         return "invalid arguments";
     case Status::ErrorRenderFailed:
         return "render failed";
-    case Status::ErrorPlyLoad:
-        return "ply load failed";
     case Status::ErrorPngWrite:
         return "png write failed";
     default:
         return "unknown";
     }
+}
+
+void resetCudaDevice() {
+#ifdef GSPLAT_CUDA_ENABLED
+    cudaDeviceReset();
+#endif
 }
 
 bool isCudaAvailable() {
@@ -60,15 +63,8 @@ void Rasterizer::setSettings(const RenderSettings& s) {
 
 RenderSettings Rasterizer::settings() const { return impl_->settings; }
 
-Status Rasterizer::setGaussians(const std::vector<Gaussian>& gaussians) {
-    impl_->gaussians = gaussians;
-    if (!impl_->engine.upload(impl_->gaussians)) return Status::ErrorNoGaussians;
-    return Status::Ok;
-}
-
-Status Rasterizer::loadPly(const std::string& path, const PlyLoadOptions& opts) {
-    impl_->gaussians.clear();
-    if (!loadGaussianPly(path, impl_->gaussians, opts)) return Status::ErrorPlyLoad;
+Status Rasterizer::setGaussians(std::vector<Gaussian> gaussians) {
+    impl_->gaussians = std::move(gaussians);
     if (!impl_->engine.upload(impl_->gaussians)) return Status::ErrorNoGaussians;
     return Status::Ok;
 }
@@ -107,33 +103,32 @@ Status Rasterizer::renderToPng(const Camera& cam, int width, int height, const s
     return Status::Ok;
 }
 
-namespace {
-struct PickCtx {
-    const Rasterizer* raster;
-};
-
-int pickScore(const Camera& cam, void* ctx) {
-    const auto* p = static_cast<PickCtx*>(ctx);
-    if (!p || !p->raster) return 0;
-    return p->raster->countFrustumPass(cam);
-}
-}  // namespace
-
 void buildCameraLookAt(const double eye[3], const double center[3], const double up[3],
                        double fov_y_deg, double aspect, double znear, double zfar,
                        const double ref_center[3], Camera& out, Rasterizer* raster_for_pick) {
     internal::LookAtMats mats;
     if (raster_for_pick && raster_for_pick->numGaussians() > 0) {
-        PickCtx ctx{raster_for_pick};
-        internal::pickMatMode(eye, center, up, fov_y_deg, aspect, znear, zfar, ref_center, pickScore,
+        struct PickCtx {
+            const Rasterizer* raster;
+        } ctx{raster_for_pick};
+        auto score = [](const Camera& cam, void* p) -> int {
+            const auto* pc = static_cast<PickCtx*>(p);
+            if (!pc || !pc->raster) return 0;
+            return pc->raster->countFrustumPass(cam);
+        };
+        internal::pickMatMode(eye, center, up, fov_y_deg, aspect, znear, zfar, ref_center, score,
                               &ctx, mats);
     } else {
         internal::buildLookAtMats(eye, center, up, fov_y_deg, aspect, znear, zfar, ref_center, mats,
-                                  internal::matModeInriaFullProj(), false);
+                                  internal::defaultMatMode(), false);
     }
-    // Official 3DGS CUDA: inria view + packInria(V * P). NDC pick may prefer GlClip; override.
-    internal::buildLookAtMats(eye, center, up, fov_y_deg, aspect, znear, zfar, ref_center, mats,
-                              internal::matModeInriaFullProj(), false);
+    internal::matsToCamera(mats, out);
+}
+
+void buildCameraFromOsg(const double view_osg[16], const double proj_osg[16],
+                        const double ref_center[3], Camera& out) {
+    internal::LookAtMats mats;
+    internal::buildOsgMats(view_osg, proj_osg, ref_center, mats);
     internal::matsToCamera(mats, out);
 }
 

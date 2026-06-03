@@ -6,7 +6,11 @@ if(NOT GSPLAT_CUDA)
 endif()
 
 if(GSPLAT_USE_CUDA_TOOLCHAIN)
-    include("${CMAKE_SOURCE_DIR}/cmake/cuda_compiler_cache.cmake")
+    if(EXISTS "${PROJECT_SOURCE_DIR}/cmake/cuda_compiler_cache.cmake")
+        include("${PROJECT_SOURCE_DIR}/cmake/cuda_compiler_cache.cmake")
+    elseif(EXISTS "${CMAKE_CURRENT_LIST_DIR}/cuda_compiler_cache.cmake")
+        include("${CMAKE_CURRENT_LIST_DIR}/cuda_compiler_cache.cmake")
+    endif()
 elseif(MSVC)
     set(_nvcc_host
         "-allow-unsupported-compiler"
@@ -40,7 +44,7 @@ endif()
 
 find_package(CUDAToolkit REQUIRED)
 if(NOT DEFINED GSPLAT_DGR_ROOT)
-    set(GSPLAT_DGR_ROOT "${CMAKE_SOURCE_DIR}/third_party/diff-gaussian-rasterization")
+    set(GSPLAT_DGR_ROOT "${PROJECT_SOURCE_DIR}/third_party/diff-gaussian-rasterization")
 endif()
 if(NOT EXISTS "${GSPLAT_DGR_ROOT}/cuda_rasterizer/rasterizer.h")
     message(WARNING "Missing diff-gaussian-rasterization at ${GSPLAT_DGR_ROOT}")

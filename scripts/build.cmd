@@ -45,18 +45,19 @@ if not exist "%NINJA%" (
 
 if not exist build mkdir build
 cd build
-if exist CMakeCache.txt del /f CMakeCache.txt
+if "%GSPLAT_CLEAN_BUILD%"=="1" (
+    if exist CMakeCache.txt del /f CMakeCache.txt
+)
 
 cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release ^
   -DCMAKE_MAKE_PROGRAM="%NINJA%" ^
   -DGSPLAT_DGR_ROOT="%DGR%" ^
-  -DGSPLAT_USE_CUDA_TOOLCHAIN=ON ^
-  -DGSPLAT_BUILD_EXAMPLES=ON
+  -DGSPLAT_USE_CUDA_TOOLCHAIN=ON
 if errorlevel 1 exit /b 1
 
-"%NINJA%" gsplat_render_ply
+"%NINJA%" gsplat_raster
 if errorlevel 1 exit /b 1
 
 echo.
-echo OK: %CD%\gsplat_render_ply.exe
+echo OK: %CD%\sdk\gsplat_raster.lib
 endlocal
