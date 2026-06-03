@@ -238,6 +238,7 @@ void eyeWorldFromOsgView(const Mat4& V_raw, float out[3]) {
         out[0] = out[1] = out[2] = 0.f;
         return;
     }
+    // OSG stores matrices row-major; camera world position is inv row 3 (cols 0..2).
     out[0] = static_cast<float>(inv(3, 0));
     out[1] = static_cast<float>(inv(3, 1));
     out[2] = static_cast<float>(inv(3, 2));
@@ -253,9 +254,9 @@ void camPosFromView(const float view_cm[16], float out[3]) {
         out[0] = out[1] = out[2] = 0.f;
         return;
     }
-    out[0] = static_cast<float>(inv(3, 0));
-    out[1] = static_cast<float>(inv(3, 1));
-    out[2] = static_cast<float>(inv(3, 2));
+    out[0] = static_cast<float>(inv(0, 3));
+    out[1] = static_cast<float>(inv(1, 3));
+    out[2] = static_cast<float>(inv(2, 3));
 }
 
 struct SceneMats {
@@ -363,7 +364,6 @@ struct OsgScene {
     Mat4 V;
     Mat4 V_raw;
     Mat4 proj_gl;
-    Mat4 P_inria_pure;
     double fovX = 0;
     double fovY = 0;
     double znear = 0.01;
@@ -383,18 +383,18 @@ OsgScene makeOsgScene(const double view_osg[16], const double proj_osg[16], cons
         s.znear = 0.01;
         s.zfar = 10000.0;
     }
-    // Same as 3dgs buildCudaMatrices: pure Inria P from FOV, not patched OSG rows.
-    s.P_inria_pure = projectionInria(s.znear, s.zfar, s.fovX, s.fovY);
     return s;
 }
 
-/** Inria diff-gaussian-rasterization: view=world→cam, proj=world→clip (V * P_inria, Z in [0,1]). */
-void buildOsgCameraInria(const OsgScene& scene, LookAtMats& out) {
-    packInria(scene.V, out.view);
-    packInria(scene.V * scene.P_inria_pure, out.proj);
+/** OpenGL unified path: view=world->view, proj=clip<-world with NDC z in [-1,1]. */
+void buildOsgCameraGl(const OsgScene& scene, LookAtMats& out) {
+    packColMajor(scene.V, out.view);
+    const Mat4 clip = scene.proj_gl * scene.V;
+    packColMajor(clip, out.proj);
     eyeWorldFromOsgView(scene.V_raw, out.cam_pos);
     if (std::fabs(out.cam_pos[0]) < 1e-6f && std::fabs(out.cam_pos[1]) < 1e-6f &&
         std::fabs(out.cam_pos[2]) < 1e-6f) {
+        std::cout << "[CUDA camera] eye from osg view is near-zero, fallback to SDK view inversion\n";
         camPosFromView(out.view, out.cam_pos);
     }
     out.tan_fovx = static_cast<float>(std::tan(scene.fovX * 0.5));
@@ -403,7 +403,7 @@ void buildOsgCameraInria(const OsgScene& scene, LookAtMats& out) {
 
 }  // namespace
 
-int defaultMatMode() { return encodeMode(ViewPack::Inria, ProjPack::GlClip); }
+int defaultMatMode() { return encodeMode(ViewPack::Gl, ProjPack::GlClip); }
 
 void matsToCamera(const LookAtMats& mats, Camera& out) {
     std::memcpy(out.view, mats.view, sizeof(out.view));
@@ -475,7 +475,7 @@ void pickMatMode(const double eye[3], const double center[3], const double up[3]
 void buildOsgMats(const double view_osg[16], const double proj_osg[16], const double ref_center[3],
                   LookAtMats& out) {
     const OsgScene scene = makeOsgScene(view_osg, proj_osg, ref_center);
-    buildOsgCameraInria(scene, out);
+    buildOsgCameraGl(scene, out);
 }
 
 }  // namespace internal

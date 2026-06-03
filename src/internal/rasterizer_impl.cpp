@@ -193,11 +193,10 @@ void CudaRasterEngine::uploadOne(const std::vector<Gaussian>& cloud) {
         means3D_[static_cast<size_t>(i) * 3 + 2] = finite(g.z);
 
         opacities_[static_cast<size_t>(i)] = clamp01(sigmoid(finite(g.opacity_logit)));
-        // Clamp extreme large splats from noisy/exported PLYs.
-        // Use a tighter upper bound to preserve scene details (avoid over-blurry large splats).
-        const float sx = std::clamp(finite(g.scale_log[0]), -20.f, -4.0f);
-        const float sy = std::clamp(finite(g.scale_log[1]), -20.f, -4.0f);
-        const float sz = std::clamp(finite(g.scale_log[2]), -20.f, -4.0f);
+        // Keep numeric-safe range but cap large splats to avoid upper-layer overdraw hiding background structure.
+        const float sx = std::clamp(finite(g.scale_log[0]), -20.f, 0.0f);
+        const float sy = std::clamp(finite(g.scale_log[1]), -20.f, 0.0f);
+        const float sz = std::clamp(finite(g.scale_log[2]), -20.f, 0.0f);
         scales_[static_cast<size_t>(i) * 3 + 0] = std::exp(sx);
         scales_[static_cast<size_t>(i) * 3 + 1] = std::exp(sy);
         scales_[static_cast<size_t>(i) * 3 + 2] = std::exp(sz);
@@ -268,15 +267,19 @@ int CudaRasterEngine::countFrustumPass(const float view[16], const float proj[16
     for (int i = 0; i < num_splats_; i += step) {
         const size_t o = static_cast<size_t>(i) * 3;
         const float x = means3D_[o], y = means3D_[o + 1], z = means3D_[o + 2];
-        const float pz = view[2] * x + view[6] * y + view[10] * z + view[14];
-        if (pz <= 0.2f) continue;
+        const float view_z = view[2] * x + view[6] * y + view[10] * z + view[14];
+        if (view_z >= -1e-4f) continue;
         const float hx = proj[0] * x + proj[4] * y + proj[8] * z + proj[12];
         const float hy = proj[1] * x + proj[5] * y + proj[9] * z + proj[13];
+        const float hz = proj[2] * x + proj[6] * y + proj[10] * z + proj[14];
         const float hw = proj[3] * x + proj[7] * y + proj[11] * z + proj[15];
         if (hw <= 1e-6f) continue;
         const float invw = 1.f / hw;
-        const float nx = hx * invw, ny = hy * invw;
-        if (nx >= -1.3f && nx <= 1.3f && ny >= -1.3f && ny <= 1.3f) ++pass;
+        const float nx = hx * invw, ny = hy * invw, nz = hz * invw;
+        if (nx >= -1.3f && nx <= 1.3f && ny >= -1.3f && ny <= 1.3f &&
+            nz >= -1.0f && nz <= 1.0f) {
+            ++pass;
+        }
     }
     return pass;
 }

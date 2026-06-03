@@ -27,7 +27,7 @@ void pickMatMode(const double eye[3], const double center[3], const double up[3]
                  double aspect, double znear, double zfar, const double ref_center[3],
                  int (*score_fn)(const Camera& cam, void* ctx), void* ctx, LookAtMats& out);
 
-/// 将 OSG row-major view/proj 转成 Inria 光栅可用矩阵。
+/// 将 OSG row-major view/proj 转成 OpenGL 统一语义相机矩阵（列主序）。
 void buildOsgMats(const double view_osg[16], const double proj_osg[16], const double ref_center[3],
                   LookAtMats& out);
 

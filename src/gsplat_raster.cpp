@@ -107,21 +107,9 @@ void buildCameraLookAt(const double eye[3], const double center[3], const double
                        double fov_y_deg, double aspect, double znear, double zfar,
                        const double ref_center[3], Camera& out, Rasterizer* raster_for_pick) {
     internal::LookAtMats mats;
-    if (raster_for_pick && raster_for_pick->numGaussians() > 0) {
-        struct PickCtx {
-            const Rasterizer* raster;
-        } ctx{raster_for_pick};
-        auto score = [](const Camera& cam, void* p) -> int {
-            const auto* pc = static_cast<PickCtx*>(p);
-            if (!pc || !pc->raster) return 0;
-            return pc->raster->countFrustumPass(cam);
-        };
-        internal::pickMatMode(eye, center, up, fov_y_deg, aspect, znear, zfar, ref_center, score,
-                              &ctx, mats);
-    } else {
-        internal::buildLookAtMats(eye, center, up, fov_y_deg, aspect, znear, zfar, ref_center, mats,
-                                  internal::defaultMatMode(), false);
-    }
+    (void)raster_for_pick;
+    internal::buildLookAtMats(eye, center, up, fov_y_deg, aspect, znear, zfar, ref_center, mats,
+                              internal::defaultMatMode(), false);
     internal::matsToCamera(mats, out);
 }
 

@@ -33,7 +33,7 @@ struct RenderSettings {
     bool dc_only = false;
 };
 
-/// Inria 光栅器相机输入。
+/// 光栅器相机输入（OpenGL 统一语义）。
 /// - view/proj: 列主序 4x4（与 CUDA kernel 一致）
 /// - cam_pos: 世界坐标相机位置
 struct Camera {
@@ -102,13 +102,13 @@ private:
     Impl* impl_;
 };
 
-/// 通过 eye/center/up 构建 Inria 约定相机矩阵。
+/// 通过 eye/center/up 构建 OpenGL 语义相机矩阵。
 void buildCameraLookAt(const double eye[3], const double center[3], const double up[3],
                        double fov_y_deg, double aspect, double znear, double zfar,
                        const double ref_center[3], Camera& out,
                        Rasterizer* raster_for_pick = nullptr);
 
-/// 将 OSG 的 view/proj（row-major）转换为 Inria 相机输入。
+/// 将 OSG 的 view/proj（row-major）转换为 OpenGL 统一语义相机输入。
 void buildCameraFromOsg(const double view_osg[16], const double proj_osg[16],
                         const double ref_center[3], Camera& out);
 

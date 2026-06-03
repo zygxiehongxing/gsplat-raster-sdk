@@ -44,11 +44,13 @@ endif()
 
 find_package(CUDAToolkit REQUIRED)
 if(NOT DEFINED GSPLAT_DGR_ROOT)
-    set(GSPLAT_DGR_ROOT "${PROJECT_SOURCE_DIR}/third_party/diff-gaussian-rasterization")
+    get_filename_component(_gsplat_root "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
+    set(GSPLAT_DGR_ROOT "${_gsplat_root}/third_party/diff-gaussian-rasterization")
 endif()
 if(NOT EXISTS "${GSPLAT_DGR_ROOT}/cuda_rasterizer/rasterizer.h")
-    message(WARNING "Missing diff-gaussian-rasterization at ${GSPLAT_DGR_ROOT}")
-    return()
+    message(FATAL_ERROR
+        "Missing vendored diff-gaussian-rasterization at ${GSPLAT_DGR_ROOT}. "
+        "External fallback paths are disabled.")
 endif()
 if(NOT EXISTS "${GSPLAT_DGR_ROOT}/third_party/glm/glm/glm.hpp")
     message(FATAL_ERROR "Missing glm in diff-gaussian-rasterization (git submodule update --init)")
