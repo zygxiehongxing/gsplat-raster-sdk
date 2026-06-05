@@ -74,8 +74,8 @@ void resetCudaDevice();
 /// 将 RGB8（行优先）写入 PNG。
 bool writeRgbPng(const std::string& path, int width, int height, const std::vector<uint8_t>& rgb);
 
-/// GL SSBO 列表（cells[0..filled)）→ SDK SoA DeviceGaussianBuffers（与全量 PLY 路径一致，默认不缩放/钳 opacity）。
-Status unpackScreenSsboToDevice(const GaussianPixelGpu* d_cells, int capacity, int filled_count,
+/// GL SSBO 屏格（cells[grid_w*grid_h]）→ SDK SoA DeviceGaussianBuffers（compact 后供 EWA 光栅）。
+Status unpackScreenSsboToDevice(const GaussianPixelGpu* d_cells, int grid_w, int grid_h,
                                 DeviceGaussianBuffers& out, int& compact_out,
                                 uint32_t expected_frame_id = 0xFFFFFFFFu);
 

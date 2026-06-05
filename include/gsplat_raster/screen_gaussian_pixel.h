@@ -9,22 +9,12 @@ struct ScreenCacheMetaGpu {
     float view_glsl[16];  // row: vec4(pos,1)*u_view（glUniformMatrix4fv GL_TRUE）
     float proj_glsl[16];  // row: vec4*t*u_proj（仅 P，非 P*V）
     float cam_pos_tan[4]; // cam_pos.xyz, tan_fovx
-    uint32_t info[4];     // [0]=frame_id [1]=capacity [2]=filled [3]=viewport_xy packed
+    uint32_t info[4];     // [0]=frame_id [1]=grid_w [2]=grid_h [3]=viewport_xy packed
 };
 
 static_assert(sizeof(ScreenCacheMetaGpu) == 160, "ScreenCacheMetaGpu must be 160 bytes");
 
-/// App SSBO 列表默认容量（视锥内 3D 高斯槽位数）。
-constexpr uint32_t kDefaultScreenSsboCapacity = 2000000u;
-
-/// GL SSBO 头：meta + GPU atomic 追加计数（后接 GaussianPixelGpu cells[capacity]）。
-struct ScreenSsboListHeaderGpu {
-    ScreenCacheMetaGpu meta;
-    uint32_t append_count;
-    uint32_t _pad[3];
-};
-
-static_assert(sizeof(ScreenSsboListHeaderGpu) == 176, "ScreenSsboListHeaderGpu must be 176 bytes");
+/// GL SSBO 布局：ScreenCacheMetaGpu 后接 GaussianPixelGpu cells[grid_w * grid_h]（与窗口同尺寸）。
 
 /// Pack GL viewport origin (vp_x, vp_y) into info[3]; each component must fit uint16.
 inline uint32_t packScreenCacheViewport(int vp_x, int vp_y) {

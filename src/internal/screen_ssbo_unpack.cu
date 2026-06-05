@@ -246,7 +246,7 @@ bool unpackScreenSsboPipeline(const GaussianPixelGpu* d_cells, int capacity, int
     }
     if (out.count != filled_count) {
         freeScreenSoa(out);
-        if (!allocGaussianListSoa(filled_count, out)) return false;
+        if (!allocScreenSoa(filled_count, 1, out)) return false;
     }
     if (!unpackScreenSsboAoS(d_cells, filled_count, out, expected_frame_id, scale_mul, max_opacity)) {
         return false;
@@ -255,7 +255,7 @@ bool unpackScreenSsboPipeline(const GaussianPixelGpu* d_cells, int capacity, int
         static int log_left = 2;
         if (log_left > 0) {
             --log_left;
-            std::cout << "[CUDA unpack] list scale_mul=" << scale_mul << " max_opacity=" << max_opacity
+            std::cout << "[CUDA unpack] grid scale_mul=" << scale_mul << " max_opacity=" << max_opacity
                       << "\n";
         }
     }
