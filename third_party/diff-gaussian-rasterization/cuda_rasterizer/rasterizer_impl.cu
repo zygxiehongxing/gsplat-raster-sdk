@@ -65,6 +65,15 @@ __global__ void checkFrustum(int P,
 	present[idx] = in_frustum(idx, orig_points, viewmatrix, projmatrix, false, p_view);
 }
 
+__global__ void copyMaxRadii(int P, const int2* radii_xy, int* radii_out)
+{
+	auto idx = cg::this_grid().thread_rank();
+	if (idx >= P)
+		return;
+	const int2 r = radii_xy[idx];
+	radii_out[idx] = (r.x > 0 || r.y > 0) ? max(r.x, r.y) : 0;
+}
+
 // Generates one key/value pair for all Gaussian / tile overlaps. 
 // Run once per Gaussian (1:N mapping).
 __global__ void duplicateWithKeys(
@@ -74,7 +83,7 @@ __global__ void duplicateWithKeys(
 	const uint32_t* offsets,
 	uint64_t* gaussian_keys_unsorted,
 	uint32_t* gaussian_values_unsorted,
-	int* radii,
+	const int2* radii,
 	dim3 grid)
 {
 	auto idx = cg::this_grid().thread_rank();
@@ -82,13 +91,14 @@ __global__ void duplicateWithKeys(
 		return;
 
 	// Generate no key/value pair for invisible Gaussians
-	if (radii[idx] > 0)
+	const int2 r = radii[idx];
+	if (r.x > 0 || r.y > 0)
 	{
 		// Find this Gaussian's offset in buffer for writing keys/values.
 		uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
 		uint2 rect_min, rect_max;
 
-		getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
+		getRect(points_xy[idx], r.x, r.y, rect_min, rect_max, grid);
 
 		// For each tile that the bounding rect overlaps, emit a 
 		// key/value pair. The key is |  tile ID  |      depth      |,
@@ -224,12 +234,10 @@ int CudaRasterizer::Rasterizer::forward(
 
 	size_t chunk_size = required<GeometryState>(P);
 	char* chunkptr = geometryBuffer(chunk_size);
-	GeometryState geomState = GeometryState::fromChunk(chunkptr, P);
-
-	if (radii == nullptr)
-	{
-		radii = geomState.internal_radii;
+	if (!chunkptr) {
+		throw std::runtime_error("geometry buffer allocation failed");
 	}
+	GeometryState geomState = GeometryState::fromChunk(chunkptr, P);
 
 	dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
 	dim3 block(BLOCK_X, BLOCK_Y, 1);
@@ -237,6 +245,9 @@ int CudaRasterizer::Rasterizer::forward(
 	// Dynamically resize image-based auxiliary buffers during training
 	size_t img_chunk_size = required<ImageState>(width * height);
 	char* img_chunkptr = imageBuffer(img_chunk_size);
+	if (!img_chunkptr) {
+		throw std::runtime_error("image buffer allocation failed");
+	}
 	ImageState imgState = ImageState::fromChunk(img_chunkptr, width * height);
 
 	if (NUM_CHANNELS != 3 && colors_precomp == nullptr)
@@ -245,6 +256,10 @@ int CudaRasterizer::Rasterizer::forward(
 	}
 
 	// Run preprocessing per-Gaussian (transformation, bounding, conversion of SHs to RGB)
+	int* d_pre_dbg = nullptr;
+	int h_pre_dbg[3] = {0, 0, 0};
+	CHECK_CUDA(cudaMalloc(&d_pre_dbg, 3 * sizeof(int)), debug)
+	CHECK_CUDA(cudaMemset(d_pre_dbg, 0, 3 * sizeof(int)), debug)
 	CHECK_CUDA(FORWARD::preprocess(
 		P, D, M,
 		means3D,
@@ -261,7 +276,7 @@ int CudaRasterizer::Rasterizer::forward(
 		width, height,
 		focal_x, focal_y,
 		tan_fovx, tan_fovy,
-		radii,
+		geomState.internal_radii,
 		geomState.means2D,
 		geomState.depths,
 		geomState.cov3D,
@@ -269,8 +284,24 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.conic_opacity,
 		tile_grid,
 		geomState.tiles_touched,
-		prefiltered
+		prefiltered,
+		d_pre_dbg
 	), debug)
+	if (radii != nullptr)
+	{
+		copyMaxRadii << <(P + 255) / 256, 256 >> > (P, geomState.internal_radii, radii);
+		CHECK_CUDA(, debug)
+	}
+	CHECK_CUDA(cudaMemcpy(h_pre_dbg, d_pre_dbg, 3 * sizeof(int), cudaMemcpyDeviceToHost), debug)
+	CHECK_CUDA(cudaFree(d_pre_dbg), debug)
+	if (debug && P > 0)
+	{
+		const int cull = h_pre_dbg[0];
+		const int det0 = h_pre_dbg[1];
+		const int rect0 = h_pre_dbg[2];
+		std::cout << "[CUDA pre] P=" << P << " cull=" << cull << " det0=" << det0 << " rect0=" << rect0
+			      << " keep~" << (P - cull - det0 - rect0) << "\n";
+	}
 
 	// Compute prefix sum over full list of touched tile counts by Gaussians
 	// E.g., [2, 3, 0, 2, 1] -> [2, 5, 5, 7, 8]
@@ -282,6 +313,9 @@ int CudaRasterizer::Rasterizer::forward(
 
 	size_t binning_chunk_size = required<BinningState>(num_rendered);
 	char* binning_chunkptr = binningBuffer(binning_chunk_size);
+	if (!binning_chunkptr) {
+		throw std::runtime_error("binning buffer allocation failed");
+	}
 	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
 
 	// For each instance to be rendered, produce adequate [ tile | depth ] key 
@@ -293,7 +327,7 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.point_offsets,
 		binningState.point_list_keys_unsorted,
 		binningState.point_list_unsorted,
-		radii,
+		geomState.internal_radii,
 		tile_grid)
 	CHECK_CUDA(, debug)
 
@@ -372,10 +406,7 @@ void CudaRasterizer::Rasterizer::backward(
 	BinningState binningState = BinningState::fromChunk(binning_buffer, R);
 	ImageState imgState = ImageState::fromChunk(img_buffer, width * height);
 
-	if (radii == nullptr)
-	{
-		radii = geomState.internal_radii;
-	}
+	(void)radii;
 
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
@@ -411,7 +442,7 @@ void CudaRasterizer::Rasterizer::backward(
 	const float* cov3D_ptr = (cov3D_precomp != nullptr) ? cov3D_precomp : geomState.cov3D;
 	CHECK_CUDA(BACKWARD::preprocess(P, D, M,
 		(float3*)means3D,
-		radii,
+		geomState.internal_radii,
 		shs,
 		geomState.clamped,
 		(glm::vec3*)scales,

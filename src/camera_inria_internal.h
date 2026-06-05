@@ -27,9 +27,10 @@ void pickMatMode(const double eye[3], const double center[3], const double up[3]
                  double aspect, double znear, double zfar, const double ref_center[3],
                  int (*score_fn)(const Camera& cam, void* ctx), void* ctx, LookAtMats& out);
 
-/// 将 OSG row-major view/proj 转成 OpenGL 统一语义相机矩阵（列主序）。
+/// 将 OSG row-major view/proj 转成 CUDA 相机；有 probe 时在候选打包模式中按视锥打分选取。
 void buildOsgMats(const double view_osg[16], const double proj_osg[16], const double ref_center[3],
-                  LookAtMats& out);
+                  LookAtMats& out, int* mat_mode_out = nullptr, const float* probe_xyz = nullptr,
+                  int probe_count = 0);
 
 /// 把 LookAtMats 拷贝到公开 Camera 结构。
 void matsToCamera(const LookAtMats& mats, Camera& out);

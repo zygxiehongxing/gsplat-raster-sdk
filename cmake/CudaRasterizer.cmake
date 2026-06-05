@@ -14,16 +14,18 @@ if(GSPLAT_USE_CUDA_TOOLCHAIN)
 elseif(MSVC)
     set(_nvcc_host
         "-allow-unsupported-compiler"
-        "-Xcompiler=/allow-unsupported-compiler"
         "-Xcompiler=/D__NV_NO_HOST_COMPILER_CHECK"
-        "-Xcompiler=/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH")
+        "-Xcompiler=/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
+        "-Xcompiler=/Zc:preprocessor")
     string(JOIN " " _nvcc_host_str ${_nvcc_host})
     set(CMAKE_CUDA_FLAGS "${_nvcc_host_str} ${CMAKE_CUDA_FLAGS}")
 endif()
 
 set(_cuda_ready FALSE)
 if(CMAKE_CUDA_COMPILER)
-    enable_language(CUDA)
+    if(NOT CMAKE_CUDA_COMPILER_LOADED)
+        enable_language(CUDA)
+    endif()
     set(_cuda_ready TRUE)
 else()
     include(CheckLanguage)
@@ -43,6 +45,8 @@ if(NOT _cuda_ready)
 endif()
 
 find_package(CUDAToolkit REQUIRED)
+set(GSPLAT_CUDART_LINK CUDA::cudart)
+message(STATUS "gsplat-raster-sdk: nvcc ${CMAKE_CUDA_COMPILER_VERSION}, CUDAToolkit ${CUDAToolkit_VERSION}")
 if(NOT DEFINED GSPLAT_DGR_ROOT)
     get_filename_component(_gsplat_root "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
     set(GSPLAT_DGR_ROOT "${_gsplat_root}/third_party/diff-gaussian-rasterization")

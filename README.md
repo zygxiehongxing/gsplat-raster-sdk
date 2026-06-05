@@ -31,6 +31,8 @@ Application-side viewer/CLI lives in a sibling project:
 
 No OSG dependency in this repository.
 
+> **WIP 分支** `wip/ssbo-device-pool-pipeline`：`Rasterizer` 不再提供 `setGaussians`；由 App 的 **`GaussianDevicePool`** 上传并按相机 **`filterVisible`** 后传入 `render(cam, w, h, subset, rgb)`。CUDA preprocess 相对 `c9d587e` 有 blur/各向异性 tile 等调整；**片元 EWA 混合公式未换**。详见 [`docs/BRANCH_WIP_DEVICE_POOL.md`](docs/BRANCH_WIP_DEVICE_POOL.md)。
+
 ## Dependencies
 
 - CUDA Toolkit (tested with 11.8)

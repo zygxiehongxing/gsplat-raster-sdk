@@ -43,24 +43,67 @@ __forceinline__ __device__ float ndc2Pix(float v, int S)
 	return ((v + 1.0) * S - 1.0) * 0.5;
 }
 
-__forceinline__ __device__ void getRect(const float2 p, int max_radius, uint2& rect_min, uint2& rect_max, dim3 grid)
+/// Axis-aligned tile bounds for an ellipse: separate half-extents along screen x/y (pixels).
+__forceinline__ __device__ void getRect(const float2 p, int radius_x, int radius_y, uint2& rect_min, uint2& rect_max,
+                                        dim3 grid)
 {
 	rect_min = {
-		min(grid.x, max((int)0, (int)((p.x - max_radius) / BLOCK_X))),
-		min(grid.y, max((int)0, (int)((p.y - max_radius) / BLOCK_Y)))
+		min(grid.x, max((int)0, (int)((p.x - radius_x) / BLOCK_X))),
+		min(grid.y, max((int)0, (int)((p.y - radius_y) / BLOCK_Y)))
 	};
 	rect_max = {
-		min(grid.x, max((int)0, (int)((p.x + max_radius + BLOCK_X - 1) / BLOCK_X))),
-		min(grid.y, max((int)0, (int)((p.y + max_radius + BLOCK_Y - 1) / BLOCK_Y)))
+		min(grid.x, max((int)0, (int)((p.x + radius_x + BLOCK_X - 1) / BLOCK_X))),
+		min(grid.y, max((int)0, (int)((p.y + radius_y + BLOCK_Y - 1) / BLOCK_Y)))
 	};
 }
 
+__forceinline__ __device__ void getRect(const float2 p, int max_radius, uint2& rect_min, uint2& rect_max, dim3 grid)
+{
+	getRect(p, max_radius, max_radius, rect_min, rect_max, grid);
+}
+
+/// 3-sigma AABB half-extents (pixels) from 2D covariance eigenvalues and orientation.
+__forceinline__ __device__ float2 anisoRadiiFromCov(const float3& cov, float lambda1, float lambda2)
+{
+	float2 u1;
+	const float b = cov.y;
+	const float a = cov.x;
+	if (fabsf(b) > 1e-6f) {
+		u1 = make_float2(b, lambda1 - a);
+	} else {
+		u1 = (a >= cov.z) ? make_float2(1.f, 0.f) : make_float2(0.f, 1.f);
+	}
+	const float inv_len = rsqrtf(u1.x * u1.x + u1.y * u1.y);
+	u1.x *= inv_len;
+	u1.y *= inv_len;
+	const float2 u2 = make_float2(-u1.y, u1.x);
+	float rx = ceilf(3.f * sqrtf(fmaxf(0.1f, lambda1 * u1.x * u1.x + lambda2 * u2.x * u2.x)));
+	float ry = ceilf(3.f * sqrtf(fmaxf(0.1f, lambda1 * u1.y * u1.y + lambda2 * u2.y * u2.y)));
+	// Screen-cache / dense views: smaller cap reduces solid color blocks (was 32).
+	const float kMaxSplatRadius = 14.f;
+	rx = fminf(fmaxf(rx, 1.f), kMaxSplatRadius);
+	ry = fminf(fmaxf(ry, 1.f), kMaxSplatRadius);
+	return make_float2(rx, ry);
+}
+
+// GLSL row-major: vec4(p,1) * M, M[r*4+c] = M(r,c).
+
+/// OSG/GL row view：相机朝 -Z，在前的点 view.z < 0；沿视线深度 = -view.z（>0）。
+__forceinline__ __device__ bool viewInFrontGlRow(float3 t_view)
+{
+	return t_view.z < 0.0f;
+}
+
+__forceinline__ __device__ float viewDepthGlRow(float3 t_view)
+{
+	return -t_view.z;
+}
 __forceinline__ __device__ float3 transformPoint4x3(const float3& p, const float* matrix)
 {
 	float3 transformed = {
-		matrix[0] * p.x + matrix[4] * p.y + matrix[8] * p.z + matrix[12],
-		matrix[1] * p.x + matrix[5] * p.y + matrix[9] * p.z + matrix[13],
-		matrix[2] * p.x + matrix[6] * p.y + matrix[10] * p.z + matrix[14],
+		matrix[0] * p.x + matrix[1] * p.y + matrix[2] * p.z + matrix[3],
+		matrix[4] * p.x + matrix[5] * p.y + matrix[6] * p.z + matrix[7],
+		matrix[8] * p.x + matrix[9] * p.y + matrix[10] * p.z + matrix[11],
 	};
 	return transformed;
 }
@@ -68,20 +111,40 @@ __forceinline__ __device__ float3 transformPoint4x3(const float3& p, const float
 __forceinline__ __device__ float4 transformPoint4x4(const float3& p, const float* matrix)
 {
 	float4 transformed = {
-		matrix[0] * p.x + matrix[4] * p.y + matrix[8] * p.z + matrix[12],
-		matrix[1] * p.x + matrix[5] * p.y + matrix[9] * p.z + matrix[13],
-		matrix[2] * p.x + matrix[6] * p.y + matrix[10] * p.z + matrix[14],
-		matrix[3] * p.x + matrix[7] * p.y + matrix[11] * p.z + matrix[15]
+		matrix[0] * p.x + matrix[1] * p.y + matrix[2] * p.z + matrix[3],
+		matrix[4] * p.x + matrix[5] * p.y + matrix[6] * p.z + matrix[7],
+		matrix[8] * p.x + matrix[9] * p.y + matrix[10] * p.z + matrix[11],
+		matrix[12] * p.x + matrix[13] * p.y + matrix[14] * p.z + matrix[15]
 	};
 	return transformed;
+}
+
+/// GLSL: vec4(p,1) * view * proj（view/proj 均为行主序，proj 仅为 P）。
+__forceinline__ __device__ float4 worldToClipRow(const float3& p, const float* view, const float* proj)
+{
+	const float v[4] = { p.x, p.y, p.z, 1.0f };
+	float t[4] = {};
+	for (int c = 0; c < 4; ++c) {
+		float s = 0.0f;
+		for (int r = 0; r < 4; ++r) {
+			s += v[r] * view[r * 4 + c];
+		}
+		t[c] = s;
+	}
+	float4 clip = {};
+	clip.x = t[0] * proj[0] + t[1] * proj[4] + t[2] * proj[8] + t[3] * proj[12];
+	clip.y = t[0] * proj[1] + t[1] * proj[5] + t[2] * proj[9] + t[3] * proj[13];
+	clip.z = t[0] * proj[2] + t[1] * proj[6] + t[2] * proj[10] + t[3] * proj[14];
+	clip.w = t[0] * proj[3] + t[1] * proj[7] + t[2] * proj[11] + t[3] * proj[15];
+	return clip;
 }
 
 __forceinline__ __device__ float3 transformVec4x3(const float3& p, const float* matrix)
 {
 	float3 transformed = {
-		matrix[0] * p.x + matrix[4] * p.y + matrix[8] * p.z,
-		matrix[1] * p.x + matrix[5] * p.y + matrix[9] * p.z,
-		matrix[2] * p.x + matrix[6] * p.y + matrix[10] * p.z,
+		matrix[0] * p.x + matrix[1] * p.y + matrix[2] * p.z,
+		matrix[4] * p.x + matrix[5] * p.y + matrix[6] * p.z,
+		matrix[8] * p.x + matrix[9] * p.y + matrix[10] * p.z,
 	};
 	return transformed;
 }
@@ -89,9 +152,9 @@ __forceinline__ __device__ float3 transformVec4x3(const float3& p, const float* 
 __forceinline__ __device__ float3 transformVec4x3Transpose(const float3& p, const float* matrix)
 {
 	float3 transformed = {
-		matrix[0] * p.x + matrix[1] * p.y + matrix[2] * p.z,
-		matrix[4] * p.x + matrix[5] * p.y + matrix[6] * p.z,
-		matrix[8] * p.x + matrix[9] * p.y + matrix[10] * p.z,
+		matrix[0] * p.x + matrix[4] * p.y + matrix[8] * p.z,
+		matrix[1] * p.x + matrix[5] * p.y + matrix[9] * p.z,
+		matrix[2] * p.x + matrix[6] * p.y + matrix[10] * p.z,
 	};
 	return transformed;
 }
@@ -144,24 +207,12 @@ __forceinline__ __device__ bool in_frustum(int idx,
 	float3& p_view)
 {
 	float3 p_orig = { orig_points[3 * idx], orig_points[3 * idx + 1], orig_points[3 * idx + 2] };
-
-	// Bring points to screen space
-	float4 p_hom = transformPoint4x4(p_orig, projmatrix);
-	float p_w = 1.0f / (p_hom.w + 0.0000001f);
-	float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };
 	p_view = transformPoint4x3(p_orig, viewmatrix);
+	(void)prefiltered;
 
-	// OpenGL convention:
-	// - camera looks down -Z, so visible points satisfy view_z < 0
-	// - NDC z range is [-1, 1]
-	const float view_depth = -p_view.z;
-	if (p_hom.w <= 0.0000001f || view_depth <= 0.0001f || p_proj.z < -1.0f || p_proj.z > 1.0f)
+	float4 p_hom = worldToClipRow(p_orig, viewmatrix, projmatrix);
+	if (p_hom.w <= 0.0000001f)
 	{
-		if (prefiltered)
-		{
-			printf("Point is filtered although prefiltered is set. This shouldn't happen!");
-			__trap();
-		}
 		return false;
 	}
 	return true;

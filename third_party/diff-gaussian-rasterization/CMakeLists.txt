@@ -11,7 +11,13 @@
 
 cmake_minimum_required(VERSION 3.20)
 
-project(DiffRast LANGUAGES CUDA CXX)
+# When vendored inside gsplat-raster-sdk, CUDA is already enabled by CudaRasterizer.cmake.
+if(PROJECT_NAME STREQUAL "gsplat-raster-sdk" OR PROJECT_NAME STREQUAL "gsplat-raster-app")
+    set(_dgr_standalone FALSE)
+else()
+    project(DiffRast LANGUAGES CUDA CXX)
+    set(_dgr_standalone TRUE)
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_EXTENSIONS OFF)

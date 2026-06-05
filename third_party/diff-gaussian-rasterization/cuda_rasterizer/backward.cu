@@ -143,7 +143,7 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 // backward steps contained in preprocess)
 __global__ void computeCov2DCUDA(int P,
 	const float3* means,
-	const int* radii,
+	const int2* radii,
 	const float* cov3Ds,
 	const float h_x, float h_y,
 	const float tan_fovx, float tan_fovy,
@@ -153,7 +153,7 @@ __global__ void computeCov2DCUDA(int P,
 	float* dL_dcov)
 {
 	auto idx = cg::this_grid().thread_rank();
-	if (idx >= P || !(radii[idx] > 0))
+	if (idx >= P || !(radii[idx].x > 0 || radii[idx].y > 0))
 		return;
 
 	// Reading location of 3D covariance for this Gaussian
@@ -164,7 +164,9 @@ __global__ void computeCov2DCUDA(int P,
 	float3 mean = means[idx];
 	float3 dL_dconic = { dL_dconics[4 * idx], dL_dconics[4 * idx + 1], dL_dconics[4 * idx + 3] };
 	float3 t = transformPoint4x3(mean, view_matrix);
-	const float z = max(-t.z, 1e-6f);
+	if (!viewInFrontGlRow(t))
+		return;
+	const float z = viewDepthGlRow(t);
 	
 	const float limx = 1.3f * tan_fovx;
 	const float limy = 1.3f * tan_fovy;
@@ -350,7 +352,7 @@ template<int C>
 __global__ void preprocessCUDA(
 	int P, int D, int M,
 	const float3* means,
-	const int* radii,
+	const int2* radii,
 	const float* shs,
 	const bool* clamped,
 	const glm::vec3* scales,
@@ -367,7 +369,7 @@ __global__ void preprocessCUDA(
 	glm::vec4* dL_drot)
 {
 	auto idx = cg::this_grid().thread_rank();
-	if (idx >= P || !(radii[idx] > 0))
+	if (idx >= P || !(radii[idx].x > 0 || radii[idx].y > 0))
 		return;
 
 	float3 m = means[idx];
@@ -562,7 +564,7 @@ renderCUDA(
 void BACKWARD::preprocess(
 	int P, int D, int M,
 	const float3* means3D,
-	const int* radii,
+	const int2* radii,
 	const float* shs,
 	const bool* clamped,
 	const glm::vec3* scales,

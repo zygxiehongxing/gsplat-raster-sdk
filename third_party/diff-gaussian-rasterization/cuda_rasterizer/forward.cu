@@ -70,15 +70,16 @@ __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const 
 	return glm::max(result, 0.0f);
 }
 
-// Forward version of 2D covariance matrix computation
-__device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y, float tan_fovx, float tan_fovy, const float* cov3D, const float* viewmatrix)
+// Forward version of 2D covariance matrix computation (p_view from row-major GL view).
+__device__ float3 computeCov2D(const float3& p_view, float focal_x, float focal_y, float tan_fovx, float tan_fovy,
+	const float* cov3D, const float* viewmatrix)
 {
-	// The following models the steps outlined by equations 29
-	// and 31 in "EWA Splatting" (Zwicker et al., 2002). 
-	// Additionally considers aspect / scaling of viewport.
-	// Transposes used to account for row-/column-major conventions.
-	float3 t = transformPoint4x3(mean, viewmatrix);
-	const float z = max(-t.z, 1e-6f);
+	// GL/OSG: in-front => p_view.z < 0; EWA depth = -p_view.z (not max(-z, eps) for z>=0).
+	if (!viewInFrontGlRow(p_view))
+		return {0.0f, 0.0f, 0.0f};
+
+	float3 t = p_view;
+	const float z = viewDepthGlRow(p_view);
 
 	const float limx = 1.3f * tan_fovx;
 	const float limy = 1.3f * tan_fovy;
@@ -92,6 +93,7 @@ __device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y,
 		0.0f, focal_y / z, -(focal_y * t.y) / (z * z),
 		0, 0, 0);
 
+	// Row GLSL view: t = p*V (column form V^T*p). EWA needs R = upper 3x3 of V^T => rows of W are cols of V.
 	glm::mat3 W = glm::mat3(
 		viewmatrix[0], viewmatrix[4], viewmatrix[8],
 		viewmatrix[1], viewmatrix[5], viewmatrix[9],
@@ -170,7 +172,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	const int W, int H,
 	const float tan_fovx, float tan_fovy,
 	const float focal_x, float focal_y,
-	int* radii,
+	int2* radii,
 	float2* points_xy_image,
 	float* depths,
 	float* cov3Ds,
@@ -178,7 +180,8 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float4* conic_opacity,
 	const dim3 grid,
 	uint32_t* tiles_touched,
-	bool prefiltered)
+	bool prefiltered,
+	int* debug_counts)
 {
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P)
@@ -186,22 +189,28 @@ __global__ void preprocessCUDA(int P, int D, int M,
 
 	// Initialize radius and touched tiles to 0. If this isn't changed,
 	// this Gaussian will not be processed further.
-	radii[idx] = 0;
+	radii[idx] = {0, 0};
 	tiles_touched[idx] = 0;
 
 	// Perform near culling, quit if outside.
 	float3 p_view;
 	if (!in_frustum(idx, orig_points, viewmatrix, projmatrix, prefiltered, p_view))
+	{
+		if (debug_counts) atomicAdd(&debug_counts[0], 1);
 		return;
+	}
+	if (!viewInFrontGlRow(p_view))
+	{
+		if (debug_counts) atomicAdd(&debug_counts[0], 1);
+		return;
+	}
 
-	// Transform point by projecting
 	float3 p_orig = { orig_points[3 * idx], orig_points[3 * idx + 1], orig_points[3 * idx + 2] };
-	float4 p_hom = transformPoint4x4(p_orig, projmatrix);
+
+	float4 p_hom = worldToClipRow(p_orig, viewmatrix, projmatrix);
 	float p_w = 1.0f / (p_hom.w + 0.0000001f);
 	float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };
 
-	// If 3D covariance matrix is precomputed, use it, otherwise compute
-	// from scaling and rotation parameters. 
 	const float* cov3D;
 	if (cov3D_precomp != nullptr)
 	{
@@ -213,33 +222,59 @@ __global__ void preprocessCUDA(int P, int D, int M,
 		cov3D = cov3Ds + idx * 6;
 	}
 
-	// Compute 2D screen-space covariance matrix
-	float3 cov = computeCov2D(p_orig, focal_x, focal_y, tan_fovx, tan_fovy, cov3D, viewmatrix);
-	// Match our GLSL splat path: small screen-space blur stabilizes tiny eigenvalues.
-	cov.x += 0.3f;
-	cov.z += 0.3f;
+	float3 cov = computeCov2D(p_view, focal_x, focal_y, tan_fovx, tan_fovy, cov3D, viewmatrix);
+	cov.x += 0.15f;
+	cov.z += 0.15f;
+
+	const float det_check = (cov.x * cov.z - cov.y * cov.y);
+	if (det_check == 0.0f)
+	{
+		if (debug_counts) atomicAdd(&debug_counts[1], 1);
+		return;
+	}
+	const float mid = 0.5f * (cov.x + cov.z);
+	const float lambda1 = mid + sqrt(max(0.1f, mid * mid - det_check));
+	const float lambda2 = mid - sqrt(max(0.1f, mid * mid - det_check));
+	const float2 aniso = anisoRadiiFromCov(cov, lambda1, lambda2);
+	const int radius_x = static_cast<int>(aniso.x);
+	const int radius_y = static_cast<int>(aniso.y);
+	float2 point_image = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };
 
 	// Invert covariance (EWA algorithm)
-	float det = (cov.x * cov.z - cov.y * cov.y);
+	const float det = (cov.x * cov.z - cov.y * cov.y);
 	if (det == 0.0f)
+	{
+		if (debug_counts) atomicAdd(&debug_counts[1], 1);
 		return;
-	float det_inv = 1.f / det;
-	float3 conic = { cov.z * det_inv, -cov.y * det_inv, cov.x * det_inv };
-
-	// Compute extent in screen space (by finding eigenvalues of
-	// 2D covariance matrix). Use extent to compute a bounding rectangle
-	// of screen-space tiles that this Gaussian overlaps with. Quit if
-	// rectangle covers 0 tiles. 
-	float mid = 0.5f * (cov.x + cov.z);
-	float lambda1 = mid + sqrt(max(0.1f, mid * mid - det));
-	float lambda2 = mid - sqrt(max(0.1f, mid * mid - det));
-	float my_radius = ceil(3.f * sqrt(max(lambda1, lambda2)));
-	my_radius = max(my_radius, 1.0f);
-	float2 point_image = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };
+	}
+	const float det_inv = 1.f / det;
+	const float3 conic = { cov.z * det_inv, -cov.y * det_inv, cov.x * det_inv };
 	uint2 rect_min, rect_max;
-	getRect(point_image, my_radius, rect_min, rect_max, grid);
+	getRect(point_image, radius_x, radius_y, rect_min, rect_max, grid);
 	if ((rect_max.x - rect_min.x) * (rect_max.y - rect_min.y) == 0)
-		return;
+	{
+		// Strategy: if the projected center is on-screen, keep at least one tile.
+		// This avoids dropping tiny but valid splats due to tile-grid discretization.
+		const bool in_screen =
+			(point_image.x >= 0.0f && point_image.x < static_cast<float>(W) &&
+			 point_image.y >= 0.0f && point_image.y < static_cast<float>(H));
+		if (in_screen)
+		{
+			const int gx = static_cast<int>(grid.x);
+			const int gy = static_cast<int>(grid.y);
+			int tx = static_cast<int>(point_image.x) / BLOCK_X;
+			int ty = static_cast<int>(point_image.y) / BLOCK_Y;
+			tx = max(0, min(gx - 1, tx));
+			ty = max(0, min(gy - 1, ty));
+			rect_min = { static_cast<unsigned>(tx), static_cast<unsigned>(ty) };
+			rect_max = { static_cast<unsigned>(min(gx, tx + 1)), static_cast<unsigned>(min(gy, ty + 1)) };
+		}
+		else
+		{
+			if (debug_counts) atomicAdd(&debug_counts[2], 1);
+			return;
+		}
+	}
 
 	// If colors have been precomputed, use them, otherwise convert
 	// spherical harmonics coefficients to RGB color.
@@ -252,8 +287,8 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	}
 
 	// Store some useful helper data for the next steps.
-	depths[idx] = -p_view.z;
-	radii[idx] = my_radius;
+	depths[idx] = viewDepthGlRow(p_view);
+	radii[idx] = {radius_x, radius_y};
 	points_xy_image[idx] = point_image;
 	// Inverse 2D covariance and opacity neatly pack into one float4
 	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacities[idx] };
@@ -420,7 +455,7 @@ void FORWARD::preprocess(int P, int D, int M,
 	const int W, int H,
 	const float focal_x, float focal_y,
 	const float tan_fovx, float tan_fovy,
-	int* radii,
+	int2* radii,
 	float2* means2D,
 	float* depths,
 	float* cov3Ds,
@@ -428,7 +463,8 @@ void FORWARD::preprocess(int P, int D, int M,
 	float4* conic_opacity,
 	const dim3 grid,
 	uint32_t* tiles_touched,
-	bool prefiltered)
+	bool prefiltered,
+	int* debug_counts)
 {
 	preprocessCUDA<NUM_CHANNELS> << <(P + 255) / 256, 256 >> > (
 		P, D, M,
@@ -455,6 +491,7 @@ void FORWARD::preprocess(int P, int D, int M,
 		conic_opacity,
 		grid,
 		tiles_touched,
-		prefiltered
+		prefiltered,
+		debug_counts
 		);
 }

@@ -2,11 +2,10 @@
 
 #include "../gaussian_types.h"
 
-#include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
-#include <limits>
 #include <stdexcept>
 
 #ifdef GSPLAT_CUDA_ENABLED
@@ -18,8 +17,6 @@ namespace gsplat {
 namespace internal {
 
 namespace {
-constexpr float kShC0 = 0.28209479177387814f;
-
 #ifdef GSPLAT_CUDA_ENABLED
 bool cudaOk(cudaError_t err, const char* what) {
     if (err == cudaSuccess) return true;
@@ -33,6 +30,22 @@ void freeDev(T*& p) {
         cudaFree(p);
         p = nullptr;
     }
+}
+
+bool cudaRasterTimingEnabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* env = std::getenv("GSPLAT_CUDA_RASTER_TIMING");
+        cached = (env && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+float elapsedCudaEventMs(cudaEvent_t start, cudaEvent_t stop) {
+    float ms = 0.f;
+    if (cudaEventSynchronize(stop) != cudaSuccess) return -1.f;
+    if (cudaEventElapsedTime(&ms, start, stop) != cudaSuccess) return -1.f;
+    return ms;
 }
 #endif
 }  // namespace
@@ -48,12 +61,6 @@ CudaRasterEngine::~CudaRasterEngine() { freeDevice(); }
 
 void CudaRasterEngine::freeDevice() {
 #ifdef GSPLAT_CUDA_ENABLED
-    freeDev(d_means3D_);
-    freeDev(d_scales_);
-    freeDev(d_rotations_);
-    freeDev(d_opacities_);
-    freeDev(d_shs_);
-    freeDev(d_colors_precomp_);
     freeDev(d_background_);
     freeDev(d_view_);
     freeDev(d_proj_);
@@ -72,8 +79,7 @@ void CudaRasterEngine::freeDevice() {
 }
 
 #ifdef GSPLAT_CUDA_ENABLED
-char* CudaRasterEngine::resizeDeviceScratch(char*& buf, size_t& capacity_bytes,
-                                            size_t required_bytes) {
+char* CudaRasterEngine::resizeDeviceScratch(char*& buf, size_t& capacity_bytes, size_t required_bytes) {
     if (required_bytes > capacity_bytes) {
         freeDev(buf);
         if (!cudaOk(cudaMalloc(&buf, required_bytes), "malloc scratch")) {
@@ -94,214 +100,69 @@ void CudaRasterEngine::setSettings(const RenderSettings& s) {
     background_[2] = s.background[2];
 }
 
-bool CudaRasterEngine::upload(const std::vector<Gaussian>& gaussians) {
-    uploadOne(gaussians);
-    if (num_splats_ <= 0) return false;
-    return uploadGaussiansToDevice();
-}
-
-bool CudaRasterEngine::uploadGaussiansToDevice() {
-#ifdef GSPLAT_CUDA_ENABLED
-    auto up = [](float*& dev, const std::vector<float>& host) -> bool {
-        freeDev(dev);
-        if (host.empty()) return true;
-        const size_t bytes = host.size() * sizeof(float);
-        if (!cudaOk(cudaMalloc(&dev, bytes), "malloc gaussian attr")) return false;
-        return cudaOk(cudaMemcpy(dev, host.data(), bytes, cudaMemcpyHostToDevice), "H2D gaussian attr");
-    };
-
-    if (!up(d_means3D_, means3D_)) return false;
-    if (!up(d_scales_, scales_)) return false;
-    if (!up(d_rotations_, rotations_)) return false;
-    if (!up(d_opacities_, opacities_)) return false;
-
-    freeDev(d_shs_);
-    freeDev(d_colors_precomp_);
-    if (sh_degree_ > 0) {
-        if (!up(d_shs_, shs_)) return false;
-    } else {
-        if (!up(d_colors_precomp_, colors_precomp_)) return false;
-    }
-
-    freeDev(d_background_);
-    if (!cudaOk(cudaMalloc(&d_background_, 3 * sizeof(float)), "malloc background")) return false;
-    if (!cudaOk(cudaMemcpy(d_background_, background_, 3 * sizeof(float), cudaMemcpyHostToDevice),
-                "H2D background")) {
+bool CudaRasterEngine::renderFromDevice(int width, int height, const float view[16], const float proj[16],
+                                        const float cam_pos[3], float tan_fovx, float tan_fovy,
+                                        const DeviceGaussianBuffers& src, std::vector<uint8_t>& out_rgb) {
+    if (src.count <= 0 || width <= 0 || height <= 0 || !src.means3D || !src.scales || !src.rotations ||
+        !src.opacities) {
         return false;
     }
-
-    if (!d_view_ && !cudaOk(cudaMalloc(&d_view_, 16 * sizeof(float)), "malloc view")) return false;
-    if (!d_proj_ && !cudaOk(cudaMalloc(&d_proj_, 16 * sizeof(float)), "malloc proj")) return false;
-    if (!d_cam_pos_ && !cudaOk(cudaMalloc(&d_cam_pos_, 3 * sizeof(float)), "malloc cam_pos")) {
-        return false;
-    }
-    return true;
-#else
-    return num_splats_ > 0;
-#endif
-}
-
-void CudaRasterEngine::uploadOne(const std::vector<Gaussian>& cloud) {
-    num_splats_ = static_cast<int>(cloud.size());
-    if (num_splats_ <= 0) return;
-
-    bool any_rest = false;
-    if (!settings_.dc_only) {
-        for (const auto& g : cloud) {
-            if (g.has_sh_rest) {
-                any_rest = true;
-                break;
-            }
-        }
-    }
-    sh_degree_ = any_rest ? 3 : 0;
-    sh_coeffs_ = any_rest ? 16 : 0;
-
-    means3D_.assign(static_cast<size_t>(num_splats_) * 3, 0.f);
-    scales_.assign(static_cast<size_t>(num_splats_) * 3, 0.f);
-    rotations_.assign(static_cast<size_t>(num_splats_) * 4, 0.f);
-    opacities_.resize(static_cast<size_t>(num_splats_));
-    shs_.assign(static_cast<size_t>(num_splats_) * static_cast<size_t>(sh_coeffs_) * 3, 0.f);
-    colors_precomp_.assign(static_cast<size_t>(num_splats_) * 3, 0.f);
-
-    auto finite = [](float v) { return std::isfinite(v) ? v : 0.f; };
-
-    // Heuristic: choose quaternion layout that looks like training export.
-    // If |rot_0| dominates for most samples, assume wxyz; otherwise assume xyzw.
-    bool quat_wxyz = true;
-    {
-        int score_wxyz = 0;
-        int score_xyzw = 0;
-        const int sample_n = std::min(num_splats_, 2048);
-        const int step = std::max(1, num_splats_ / std::max(1, sample_n));
-        for (int i = 0; i < num_splats_; i += step) {
-            const Gaussian& g = cloud[static_cast<size_t>(i)];
-            const float a0 = std::abs(finite(g.rot[0]));
-            const float a3 = std::abs(finite(g.rot[3]));
-            if (a0 >= a3) ++score_wxyz;
-            if (a3 >= a0) ++score_xyzw;
-        }
-        quat_wxyz = score_wxyz >= score_xyzw;
-        std::cout << "Quat layout: " << (quat_wxyz ? "wxyz" : "xyzw")
-                  << " (score " << score_wxyz << "/" << score_xyzw << ")\n";
-    }
-
-    for (int i = 0; i < num_splats_; ++i) {
-        const Gaussian& g = cloud[static_cast<size_t>(i)];
-        means3D_[static_cast<size_t>(i) * 3 + 0] = finite(g.x);
-        means3D_[static_cast<size_t>(i) * 3 + 1] = finite(g.y);
-        means3D_[static_cast<size_t>(i) * 3 + 2] = finite(g.z);
-
-        opacities_[static_cast<size_t>(i)] = clamp01(sigmoid(finite(g.opacity_logit)));
-        // Keep numeric-safe range but cap large splats to avoid upper-layer overdraw hiding background structure.
-        const float sx = std::clamp(finite(g.scale_log[0]), -20.f, 0.0f);
-        const float sy = std::clamp(finite(g.scale_log[1]), -20.f, 0.0f);
-        const float sz = std::clamp(finite(g.scale_log[2]), -20.f, 0.0f);
-        scales_[static_cast<size_t>(i) * 3 + 0] = std::exp(sx);
-        scales_[static_cast<size_t>(i) * 3 + 1] = std::exp(sy);
-        scales_[static_cast<size_t>(i) * 3 + 2] = std::exp(sz);
-
-        float qw = 1.f, qx = 0.f, qy = 0.f, qz = 0.f;
-        if (quat_wxyz) {
-            qw = g.rot[0];
-            qx = g.rot[1];
-            qy = g.rot[2];
-            qz = g.rot[3];
-        } else {
-            qx = g.rot[0];
-            qy = g.rot[1];
-            qz = g.rot[2];
-            qw = g.rot[3];
-        }
-        const float qlen = std::sqrt(qw * qw + qx * qx + qy * qy + qz * qz);
-        if (qlen > 1e-8f) {
-            const float inv = 1.f / qlen;
-            qw *= inv;
-            qx *= inv;
-            qy *= inv;
-            qz *= inv;
-        } else {
-            qw = 1.f;
-            qx = qy = qz = 0.f;
-        }
-        rotations_[static_cast<size_t>(i) * 4 + 0] = qw;
-        rotations_[static_cast<size_t>(i) * 4 + 1] = qx;
-        rotations_[static_cast<size_t>(i) * 4 + 2] = qy;
-        rotations_[static_cast<size_t>(i) * 4 + 3] = qz;
-
-        if (sh_degree_ > 0) {
-            for (int c = 0; c < sh_coeffs_; ++c) {
-                const size_t dst =
-                    static_cast<size_t>(i) * static_cast<size_t>(sh_coeffs_) * 3 + static_cast<size_t>(c) * 3;
-                const int src = (c == 0) ? 0 : (3 + (c - 1) * 3);
-                shs_[dst + 0] = finite(g.sh[src + 0]);
-                shs_[dst + 1] = finite(g.sh[src + 1]);
-                shs_[dst + 2] = finite(g.sh[src + 2]);
-            }
-        } else {
-            colors_precomp_[static_cast<size_t>(i) * 3 + 0] = clamp01(0.5f + kShC0 * finite(g.sh[0]));
-            colors_precomp_[static_cast<size_t>(i) * 3 + 1] = clamp01(0.5f + kShC0 * finite(g.sh[1]));
-            colors_precomp_[static_cast<size_t>(i) * 3 + 2] = clamp01(0.5f + kShC0 * finite(g.sh[2]));
-        }
-    }
-}
-
-int CudaRasterEngine::probeVisibleSplats(int w, int h, const float view[16], const float proj[16],
-                                         const float cam_pos[3], float tan_fovx, float tan_fovy) {
-    const RenderSettings saved = settings_;
-    RenderSettings boosted = saved;
-    boosted.scale_modifier = std::max(boosted.scale_modifier, 32.f);
-    setSettings(boosted);
-    std::vector<uint8_t> rgb;
-    render(w, h, view, proj, cam_pos, tan_fovx, tan_fovy, rgb);
-    const int vis = last_visible_;
-    setSettings(saved);
-    return vis;
-}
-
-int CudaRasterEngine::countFrustumPass(const float view[16], const float proj[16],
-                                       int max_samples) const {
-    if (num_splats_ <= 0) return 0;
-    const int step = std::max(1, num_splats_ / std::max(1, max_samples));
-    int pass = 0;
-    for (int i = 0; i < num_splats_; i += step) {
-        const size_t o = static_cast<size_t>(i) * 3;
-        const float x = means3D_[o], y = means3D_[o + 1], z = means3D_[o + 2];
-        const float view_z = view[2] * x + view[6] * y + view[10] * z + view[14];
-        if (view_z >= -1e-4f) continue;
-        const float hx = proj[0] * x + proj[4] * y + proj[8] * z + proj[12];
-        const float hy = proj[1] * x + proj[5] * y + proj[9] * z + proj[13];
-        const float hz = proj[2] * x + proj[6] * y + proj[10] * z + proj[14];
-        const float hw = proj[3] * x + proj[7] * y + proj[11] * z + proj[15];
-        if (hw <= 1e-6f) continue;
-        const float invw = 1.f / hw;
-        const float nx = hx * invw, ny = hy * invw, nz = hz * invw;
-        if (nx >= -1.3f && nx <= 1.3f && ny >= -1.3f && ny <= 1.3f &&
-            nz >= -1.0f && nz <= 1.0f) {
-            ++pass;
-        }
-    }
-    return pass;
-}
-
-bool CudaRasterEngine::render(int width, int height, const float view[16], const float proj[16],
-                              const float cam_pos[3], float tan_fovx, float tan_fovy,
-                              std::vector<uint8_t>& out_rgb) {
-    if (num_splats_ <= 0 || width <= 0 || height <= 0) return false;
-
 #ifndef GSPLAT_CUDA_ENABLED
     (void)view;
     (void)proj;
     (void)cam_pos;
     (void)tan_fovx;
     (void)tan_fovy;
+    (void)src;
     (void)out_rgb;
     return false;
 #else
-    if (!d_means3D_ && !uploadGaussiansToDevice()) return false;
+    return renderCore(width, height, view, proj, cam_pos, tan_fovx, tan_fovy, src.count, src.sh_degree,
+                      src.sh_coeffs, src.means3D, src.sh_degree > 0 ? src.shs : nullptr,
+                      src.sh_degree > 0 ? nullptr : src.colors_precomp, src.opacities, src.scales,
+                      src.rotations, out_rgb);
+#endif
+}
 
-    const int W = width, H = height, P = num_splats_, D = sh_degree_, M = sh_coeffs_;
+bool CudaRasterEngine::renderCore(int width, int height, const float view[16], const float proj[16],
+                                  const float cam_pos[3], float tan_fovx, float tan_fovy, int P, int D,
+                                  int M, const float* d_means3D, const float* d_shs,
+                                  const float* d_colors_precomp, const float* d_opacities,
+                                  const float* d_scales, const float* d_rotations,
+                                  std::vector<uint8_t>& out_rgb) {
+#ifndef GSPLAT_CUDA_ENABLED
+    (void)width;
+    (void)height;
+    (void)view;
+    (void)proj;
+    (void)cam_pos;
+    (void)tan_fovx;
+    (void)tan_fovy;
+    (void)P;
+    (void)D;
+    (void)M;
+    (void)d_means3D;
+    (void)d_shs;
+    (void)d_colors_precomp;
+    (void)d_opacities;
+    (void)d_scales;
+    (void)d_rotations;
+    (void)out_rgb;
+    return false;
+#else
+    if (P <= 0 || width <= 0 || height <= 0 || !d_means3D || !d_opacities || !d_scales || !d_rotations) {
+        return false;
+    }
+
+    const int W = width, H = height;
     const size_t out_floats = static_cast<size_t>(3 * H * W);
+
+    if (!d_background_ && !cudaOk(cudaMalloc(&d_background_, 3 * sizeof(float)), "malloc background")) {
+        return false;
+    }
+    if (!d_view_ && !cudaOk(cudaMalloc(&d_view_, 16 * sizeof(float)), "malloc view")) return false;
+    if (!d_proj_ && !cudaOk(cudaMalloc(&d_proj_, 16 * sizeof(float)), "malloc proj")) return false;
+    if (!d_cam_pos_ && !cudaOk(cudaMalloc(&d_cam_pos_, 3 * sizeof(float)), "malloc cam_pos")) return false;
 
     if (out_floats > d_out_color_floats_) {
         freeDev(d_out_color_);
@@ -337,61 +198,235 @@ bool CudaRasterEngine::render(int width, int height, const float view[16], const
     last_visible_ = 0;
     radii_.assign(static_cast<size_t>(P), 0);
 
-    for (int attempt = 0; attempt < 3; ++attempt) {
+    constexpr int kBlock = 16;
+    constexpr uint64_t kMaxEstTiles = 8'000'000ULL;
+    // GL SSBO 屏缓存：尺度已钳位，跳过 tile 预算重试（否则 visible 常被误杀为 0）。
+    constexpr bool kDisableTileBudgetForDiag = true;
+
+    constexpr bool kInputPrefilteredByGl = false;
+    // SSBO-screen path treats current input set as the frame's full source.
+    // Do not auto-amplify scale based on "visible count" feedback.
+    const bool time_gpu = cudaRasterTimingEnabled();
+    cudaEvent_t ev_fwd0 = nullptr;
+    cudaEvent_t ev_fwd1 = nullptr;
+    cudaEvent_t ev_d2h0 = nullptr;
+    cudaEvent_t ev_d2h1 = nullptr;
+    if (time_gpu) {
+        cudaEventCreate(&ev_fwd0);
+        cudaEventCreate(&ev_fwd1);
+        cudaEventCreate(&ev_d2h0);
+        cudaEventCreate(&ev_d2h1);
+    }
+
+    float last_fwd_ms = -1.f;
+    float last_d2h_radii_ms = -1.f;
+    auto destroyTimingEvents = [&]() {
+        if (!time_gpu) return;
+        cudaEventDestroy(ev_fwd0);
+        cudaEventDestroy(ev_fwd1);
+        cudaEventDestroy(ev_d2h0);
+        cudaEventDestroy(ev_d2h1);
+    };
+    static int timing_log_counter = 0;
+    auto logTimingLine = [&](const char* d2h_out_note) {
+        if (!time_gpu) return;
+        if ((timing_log_counter++ % 30) != 0) return;
+        std::cout << "[CUDA raster] timing " << W << "x" << H << " P=" << P
+                  << " gpu_forward_ms=" << last_fwd_ms << " d2h_radii_ms=" << last_d2h_radii_ms
+                  << " d2h_out_color_ms=" << d2h_out_note << " visible=" << last_visible_
+                  << " rendered=" << rendered << "\n";
+    };
+
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        bool forward_failed = false;
         try {
+            if (time_gpu) {
+                cudaEventRecord(ev_fwd0, 0);
+            }
             rendered = CudaRasterizer::Rasterizer::forward(
                 [&](size_t N) { return resizeDeviceScratch(d_geom_, d_geom_cap_, N); },
                 [&](size_t N) { return resizeDeviceScratch(d_binning_, d_binning_cap_, N); },
                 [&](size_t N) { return resizeDeviceScratch(d_image_, d_image_cap_, N); },
-                P, D, M, d_background_, W, H, d_means3D_, sh_degree_ > 0 ? d_shs_ : nullptr,
-                sh_degree_ > 0 ? nullptr : d_colors_precomp_, d_opacities_, d_scales_, mod,
-                d_rotations_, nullptr, d_view_, d_proj_, d_cam_pos_, tan_fovx, tan_fovy, false,
-                d_out_color_, d_radii_, true);
+                P, D, M, d_background_, W, H, d_means3D, D > 0 ? d_shs : nullptr,
+                D > 0 ? nullptr : d_colors_precomp, d_opacities, d_scales, mod, d_rotations, nullptr,
+                d_view_, d_proj_, d_cam_pos_, tan_fovx, tan_fovy, kInputPrefilteredByGl, d_out_color_,
+                d_radii_, true);
+            if (time_gpu) {
+                cudaEventRecord(ev_fwd1, 0);
+                last_fwd_ms = elapsedCudaEventMs(ev_fwd0, ev_fwd1);
+            }
         } catch (const std::exception& e) {
-            std::cerr << "CUDA rasterizer: " << e.what() << " (scale_modifier=" << mod << ")\n";
+            std::cerr << "CUDA rasterizer: " << e.what() << " (scale_modifier=" << mod << " P=" << P
+                      << ")\n";
             rendered = 0;
+            forward_failed = true;
+            cudaGetLastError();
+            freeDev(d_geom_);
+            freeDev(d_binning_);
+            freeDev(d_image_);
+            d_geom_cap_ = 0;
+            d_binning_cap_ = 0;
+            d_image_cap_ = 0;
         }
 
-        if (!cudaOk(cudaMemcpy(radii_.data(), d_radii_, static_cast<size_t>(P) * sizeof(int),
-                               cudaMemcpyDeviceToHost),
-                    "D2H radii")) {
+        if (time_gpu) {
+            cudaEventRecord(ev_d2h0, 0);
+        }
+        const bool radii_ok =
+            cudaOk(cudaMemcpy(radii_.data(), d_radii_, static_cast<size_t>(P) * sizeof(int),
+                              cudaMemcpyDeviceToHost),
+                   "D2H radii");
+        if (time_gpu) {
+            cudaEventRecord(ev_d2h1, 0);
+            last_d2h_radii_ms = elapsedCudaEventMs(ev_d2h0, ev_d2h1);
+        }
+        if (!radii_ok) {
+            cudaGetLastError();
+            last_visible_ = 0;
+            if (attempt + 1 < 2) {
+                mod *= forward_failed ? 0.5f : 0.7f;
+                cudaDeviceReset();
+                freeDevice();
+                continue;
+            }
+            logTimingLine("n/a");
+            destroyTimingEvents();
             return false;
         }
 
         last_visible_ = 0;
-        for (int r : radii_) {
-            if (r > 0) ++last_visible_;
+        int max_r = 0;
+        int max_r_idx = -1;
+        uint64_t est_tiles = 0;
+        for (int i = 0; i < P; ++i) {
+            const int r = radii_[static_cast<size_t>(i)];
+            if (r <= 0) continue;
+            ++last_visible_;
+            if (r > max_r) {
+                max_r = r;
+                max_r_idx = i;
+            }
+            const int tx = (2 * r + kBlock - 1) / kBlock;
+            est_tiles += static_cast<uint64_t>(tx) * static_cast<uint64_t>(tx);
         }
-        if (last_visible_ > 0) {
-            break;
+
+        if (max_r_idx >= 0 && max_r > 4096) {
+            static int huge_radius_log_left = 8;
+            if (huge_radius_log_left > 0) {
+                --huge_radius_log_left;
+                float mean[3] = {};
+                float scale[3] = {};
+                const size_t m_off = static_cast<size_t>(max_r_idx) * 3u;
+                cudaMemcpy(mean, d_means3D + m_off, sizeof(mean), cudaMemcpyDeviceToHost);
+                cudaMemcpy(scale, d_scales + m_off, sizeof(scale), cudaMemcpyDeviceToHost);
+                const float vx = view[0] * mean[0] + view[1] * mean[1] + view[2] * mean[2] + view[3];
+                const float vy = view[4] * mean[0] + view[5] * mean[1] + view[6] * mean[2] + view[7];
+                const float vz = view[8] * mean[0] + view[9] * mean[1] + view[10] * mean[2] + view[11];
+                float clip[4] = {};
+                const float v4[4] = {mean[0], mean[1], mean[2], 1.f};
+                float t4[4] = {};
+                for (int c = 0; c < 4; ++c) {
+                    float s = 0.f;
+                    for (int r = 0; r < 4; ++r) s += v4[r] * view[r * 4 + c];
+                    t4[c] = s;
+                }
+                for (int c = 0; c < 4; ++c) {
+                    float s = 0.f;
+                    for (int r = 0; r < 4; ++r) s += t4[r] * proj[r * 4 + c];
+                    clip[c] = s;
+                }
+                const float cx = clip[0];
+                const float cy = clip[1];
+                const float cz = clip[2];
+                const float cw = clip[3];
+                std::cerr << "[CUDA raster] huge_radius idx=" << max_r_idx << " r=" << max_r
+                          << " mod=" << mod << " mean=(" << mean[0] << "," << mean[1] << "," << mean[2]
+                          << ") scale=(" << scale[0] << "," << scale[1] << "," << scale[2]
+                          << ") view=(" << vx << "," << vy << "," << vz << ") clip=(" << cx << "," << cy
+                          << "," << cz << "," << cw << ")\n";
+            }
         }
-        mod *= 3.f;
+
+        if (!kDisableTileBudgetForDiag && last_visible_ > 0 && (est_tiles > kMaxEstTiles || max_r > 256)) {
+            static int tile_warn_left = 3;
+            if (tile_warn_left > 0) {
+                --tile_warn_left;
+                std::cerr << "[CUDA raster] tile budget exceeded: visible=" << last_visible_
+                          << " max_radius=" << max_r << " est_tiles=" << est_tiles
+                          << " scale_modifier=" << mod << " -> retry\n";
+            }
+            last_visible_ = 0;
+            rendered = 0;
+            if (attempt + 1 < 2) {
+                mod *= 0.5f;
+                continue;
+            }
+        }
+
+        if (rendered > 0) break;
+        if (forward_failed && attempt + 1 < 2) {
+            mod *= 0.5f;
+            continue;
+        }
+    }
+
+    if (P > 0) {
+        static int radii_log_left = 5;
+        if (radii_log_left > 0) {
+            --radii_log_left;
+            int max_r = 0;
+            for (int r : radii_) {
+                if (r > max_r) max_r = r;
+            }
+            std::cout << "[CUDA raster] P=" << P << " radii>0=" << last_visible_ << " max_radius=" << max_r
+                      << " scale_modifier=" << mod << "\n";
+        }
+    }
+
+    if (last_visible_ <= 0 && P > 0) {
+        static int radii_zero_log_left = 3;
+        if (radii_zero_log_left > 0) {
+            --radii_zero_log_left;
+            std::cerr << "[CUDA raster] radii=0 for all " << P << " splats (scale_modifier up to " << mod
+                      << ")\n";
+        }
     }
 
     out_rgb.resize(static_cast<size_t>(W * H * 3));
     if (rendered <= 0) {
-        const uint8_t bg[3] = {static_cast<uint8_t>(background_[0] * 255.f + 0.5f),
-                               static_cast<uint8_t>(background_[1] * 255.f + 0.5f),
-                               static_cast<uint8_t>(background_[2] * 255.f + 0.5f)};
-        for (size_t i = 0; i < out_rgb.size(); i += 3) {
-            out_rgb[i] = bg[0];
-            out_rgb[i + 1] = bg[1];
-            out_rgb[i + 2] = bg[2];
+        logTimingLine("n/a");
+        destroyTimingEvents();
+        if (P > 0) {
+            std::cerr << "[CUDA raster] forward produced no pixels (visible=" << last_visible_
+                      << " P=" << P << " scale_modifier=" << mod << ")\n";
         }
-        return true;
+        return false;
     }
 
     out_color_.resize(out_floats);
+    float d2h_out_ms = -1.f;
+    if (time_gpu) {
+        cudaEventRecord(ev_d2h0, 0);
+    }
     if (!cudaOk(cudaMemcpy(out_color_.data(), d_out_color_, out_floats * sizeof(float),
                            cudaMemcpyDeviceToHost),
                 "D2H out_color")) {
+        destroyTimingEvents();
         return false;
+    }
+    if (time_gpu) {
+        cudaEventRecord(ev_d2h1, 0);
+        d2h_out_ms = elapsedCudaEventMs(ev_d2h0, ev_d2h1);
+        std::cout << "[CUDA raster] timing " << W << "x" << H << " P=" << P
+                  << " gpu_forward_ms=" << last_fwd_ms << " d2h_radii_ms=" << last_d2h_radii_ms
+                  << " d2h_out_color_ms=" << d2h_out_ms << " visible=" << last_visible_ << "\n";
+        destroyTimingEvents();
     }
 
     for (int y = 0; y < H; ++y) {
         for (int x = 0; x < W; ++x) {
             const int dst_pix = y * W + x;
-            const int src_pix = (H - 1 - y) * W + x;  // Flip Y to match OSG window orientation.
+            const int src_pix = (H - 1 - y) * W + x;
             const size_t dst = static_cast<size_t>(dst_pix) * 3;
             const float r = out_color_[static_cast<size_t>(0 * H * W + src_pix)];
             const float g = out_color_[static_cast<size_t>(1 * H * W + src_pix)];

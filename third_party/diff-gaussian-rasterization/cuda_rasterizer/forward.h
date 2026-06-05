@@ -37,7 +37,7 @@ namespace FORWARD
 		const int W, int H,
 		const float focal_x, float focal_y,
 		const float tan_fovx, float tan_fovy,
-		int* radii,
+		int2* radii,
 		float2* points_xy_image,
 		float* depths,
 		float* cov3Ds,
@@ -45,7 +45,8 @@ namespace FORWARD
 		float4* conic_opacity,
 		const dim3 grid,
 		uint32_t* tiles_touched,
-		bool prefiltered);
+		bool prefiltered,
+		int* debug_counts);
 
 	// Main rasterization method.
 	void render(

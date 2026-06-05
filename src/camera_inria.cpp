@@ -200,6 +200,14 @@ void packColMajor(const Mat4& M, float out[16]) {
     }
 }
 
+void packRowMajor(const Mat4& M, float out[16]) {
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            out[r * 4 + c] = static_cast<float>(M(r, c));
+        }
+    }
+}
+
 void mulColMajor4x4(float* out, const float* a, const float* b) {
     for (int col = 0; col < 4; ++col) {
         for (int row = 0; row < 4; ++row) {
@@ -213,8 +221,8 @@ void mulColMajor4x4(float* out, const float* a, const float* b) {
 }
 
 float cudaViewZ(const float view[16], double x, double y, double z) {
-    return view[2] * static_cast<float>(x) + view[6] * static_cast<float>(y) +
-           view[10] * static_cast<float>(z) + view[14];
+    return view[8] * static_cast<float>(x) + view[9] * static_cast<float>(y) +
+           view[10] * static_cast<float>(z) + view[11];
 }
 
 float mvRow2Z(const Mat4& V, double x, double y, double z) {
@@ -259,6 +267,23 @@ void camPosFromView(const float view_cm[16], float out[3]) {
     out[2] = static_cast<float>(inv(2, 3));
 }
 
+void camPosFromViewRow(const float view_row[16], float out[3]) {
+    Mat4 V;
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            V(r, c) = view_row[r * 4 + c];
+        }
+    }
+    Mat4 inv;
+    if (!V.invert(inv)) {
+        out[0] = out[1] = out[2] = 0.f;
+        return;
+    }
+    out[0] = static_cast<float>(inv(3, 0));
+    out[1] = static_cast<float>(inv(3, 1));
+    out[2] = static_cast<float>(inv(3, 2));
+}
+
 struct SceneMats {
     Mat4 V;
     Mat4 proj_gl;
@@ -282,7 +307,31 @@ SceneMats makeScene(const double eye[3], const double center[3], const double up
     return s;
 }
 
-void buildViewMatrix(float out[16], ViewPack mode, const Mat4& V) {
+Mat4 transpose4(const Mat4& M) {
+    Mat4 T;
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            T(r, c) = M(c, r);
+        }
+    }
+    return T;
+}
+
+/// OSG row-major M*w (column) → Inria CUDA pack for transformPoint4x4.
+void packOsgRowMajorForCuda(const Mat4& osg_row, float out[16]) {
+    packColMajor(transpose4(osg_row), out);
+}
+
+void buildViewMatrix(float out[16], ViewPack mode, const Mat4& V, bool osg_row_major) {
+    if (osg_row_major) {
+        if (mode == ViewPack::Inria) {
+            Mat4 T = transpose4(V);
+            packInria(T, out);
+        } else {
+            packOsgRowMajorForCuda(V, out);
+        }
+        return;
+    }
     if (mode == ViewPack::Inria) {
         packInria(V, out);
     } else {
@@ -290,16 +339,25 @@ void buildViewMatrix(float out[16], ViewPack mode, const Mat4& V) {
     }
 }
 
-void buildProjMatrix(float out[16], ProjPack mode, const SceneMats& scene, bool proj_mul_pv) {
+void buildProjMatrix(float out[16], ProjPack mode, const SceneMats& scene, bool proj_mul_pv,
+                    bool osg_row_major) {
     const Mat4 clip = scene.proj_gl * scene.V;
     float v[16];
     float p[16];
     switch (mode) {
     case ProjPack::InriaClip:
-        packInria(clip, out);
+        if (osg_row_major) {
+            packInria(transpose4(clip), out);
+        } else {
+            packInria(clip, out);
+        }
         break;
     case ProjPack::GlClip:
-        packColMajor(clip, out);
+        if (osg_row_major) {
+            packOsgRowMajorForCuda(clip, out);
+        } else {
+            packColMajor(clip, out);
+        }
         break;
     case ProjPack::InriaVP:
         if (proj_mul_pv) {
@@ -314,14 +372,19 @@ void buildProjMatrix(float out[16], ProjPack mode, const SceneMats& scene, bool 
         mulColMajor4x4(out, p, v);
         break;
     case ProjPack::GlSep:
-        packColMajor(scene.proj_gl, out);
+        if (osg_row_major) {
+            packOsgRowMajorForCuda(scene.proj_gl, out);
+        } else {
+            packColMajor(scene.proj_gl, out);
+        }
         break;
     }
 }
 
-void applyMode(const SceneMats& scene, ViewPack vp, ProjPack pp, bool proj_mul_pv, LookAtMats& out) {
-    buildViewMatrix(out.view, vp, scene.V);
-    buildProjMatrix(out.proj, pp, scene, proj_mul_pv);
+void applyMode(const SceneMats& scene, ViewPack vp, ProjPack pp, bool proj_mul_pv, LookAtMats& out,
+               bool osg_row_major = false) {
+    buildViewMatrix(out.view, vp, scene.V, osg_row_major);
+    buildProjMatrix(out.proj, pp, scene, proj_mul_pv, osg_row_major);
     camPosFromView(out.view, out.cam_pos);
     out.tan_fovx = static_cast<float>(std::tan(scene.fovX * 0.5));
     out.tan_fovy = static_cast<float>(std::tan(scene.fovY * 0.5));
@@ -386,19 +449,220 @@ OsgScene makeOsgScene(const double view_osg[16], const double proj_osg[16], cons
     return s;
 }
 
-/** OpenGL unified path: view=world->view, proj=clip<-world with NDC z in [-1,1]. */
-void buildOsgCameraGl(const OsgScene& scene, LookAtMats& out) {
-    packColMajor(scene.V, out.view);
-    const Mat4 clip = scene.proj_gl * scene.V;
-    packColMajor(clip, out.proj);
+bool pointInCudaFrustum(const float* view, const float* proj, float x, float y, float z);
+void cudaWorldToClip(const float* view, const float* proj, float x, float y, float z, float clip[4]);
+void osgWorldToClip(const Mat4& V, const Mat4& P, double x, double y, double z, double clip[4]);
+
+/** 与 GL vec4(pos,1)*view*proj 一致：view/proj 均为行主序。 */
+void buildOsgCameraGl(const OsgScene& scene, const double ref_center[3], const float* probe_xyz, int probe_count,
+                      LookAtMats& out) {
+    packRowMajor(scene.V, out.view);
+    packRowMajor(scene.proj_gl, out.proj);
     eyeWorldFromOsgView(scene.V_raw, out.cam_pos);
     if (std::fabs(out.cam_pos[0]) < 1e-6f && std::fabs(out.cam_pos[1]) < 1e-6f &&
         std::fabs(out.cam_pos[2]) < 1e-6f) {
         std::cout << "[CUDA camera] eye from osg view is near-zero, fallback to SDK view inversion\n";
-        camPosFromView(out.view, out.cam_pos);
+        camPosFromViewRow(out.view, out.cam_pos);
     }
     out.tan_fovx = static_cast<float>(std::tan(scene.fovX * 0.5));
     out.tan_fovy = static_cast<float>(std::tan(scene.fovY * 0.5));
+
+    static int audit_left = 3;
+    if (audit_left > 0) {
+        --audit_left;
+        const float rx = static_cast<float>(ref_center[0]);
+        const float ry = static_cast<float>(ref_center[1]);
+        const float rz = static_cast<float>(ref_center[2]);
+        double osg_clip[4] = {};
+        osgWorldToClip(scene.V, scene.proj_gl, ref_center[0], ref_center[1], ref_center[2], osg_clip);
+        float cuda_clip[4] = {};
+        cudaWorldToClip(out.view, out.proj, rx, ry, rz, cuda_clip);
+        float osg_ndc_z = 0.f;
+        float cuda_ndc_z = 0.f;
+        if (osg_clip[3] > 1e-9) osg_ndc_z = static_cast<float>(osg_clip[2] / osg_clip[3]);
+        if (cuda_clip[3] > 1e-7f) cuda_ndc_z = cuda_clip[2] / cuda_clip[3];
+        std::cout << "[CUDA camera] osg_gl_fixed clip=P*V ref_ndc_z=" << osg_ndc_z << " cuda_ndc_z=" << cuda_ndc_z
+                  << " clip_w=" << cuda_clip[3];
+        if (probe_xyz && probe_count > 0) {
+            int ndc_match = 0;
+            int ndc_tests = 0;
+            const int step = std::max(1, probe_count / 2048);
+            for (int i = 0; i < probe_count; i += step) {
+                const float* p = probe_xyz + i * 3;
+                double osg_c[4];
+                float cuda_c[4];
+                osgWorldToClip(scene.V, scene.proj_gl, static_cast<double>(p[0]), static_cast<double>(p[1]),
+                               static_cast<double>(p[2]), osg_c);
+                cudaWorldToClip(out.view, out.proj, p[0], p[1], p[2], cuda_c);
+                if (osg_c[3] <= 1e-9 || cuda_c[3] <= 1e-7f) continue;
+                ++ndc_tests;
+                bool ok = true;
+                for (int d = 0; d < 3; ++d) {
+                    const double on = osg_c[d] / osg_c[3];
+                    const float cn = cuda_c[d] / cuda_c[3];
+                    if (std::abs(on - static_cast<double>(cn)) > 0.02) {
+                        ok = false;
+                        break;
+                    }
+                }
+                if (ok) ++ndc_match;
+            }
+            if (ndc_tests > 0) {
+                std::cout << " ndc_match=" << ndc_match << "/" << ndc_tests;
+            }
+        }
+        std::cout << " eye=(" << out.cam_pos[0] << "," << out.cam_pos[1] << "," << out.cam_pos[2] << ")\n";
+    }
+}
+
+SceneMats sceneFromOsg(const OsgScene& o) {
+    SceneMats s;
+    s.V = o.V;
+    s.proj_gl = o.proj_gl;
+    s.fovX = o.fovX;
+    s.fovY = o.fovY;
+    return s;
+}
+
+bool pointInCudaFrustum(const float* view, const float* proj, float x, float y, float z) {
+    float clip[4] = {};
+    const float v[4] = {x, y, z, 1.f};
+    float t[4] = {};
+    for (int c = 0; c < 4; ++c) {
+        float s = 0.f;
+        for (int r = 0; r < 4; ++r) s += v[r] * view[r * 4 + c];
+        t[c] = s;
+    }
+    for (int c = 0; c < 4; ++c) {
+        float s = 0.f;
+        for (int r = 0; r < 4; ++r) s += t[r] * proj[r * 4 + c];
+        clip[c] = s;
+    }
+    return clip[3] > 1e-7f;
+}
+
+int scoreFrustumProbes(const Camera& cam, const float* probe_xyz, int probe_count) {
+    if (!probe_xyz || probe_count <= 0) return 0;
+    int score = 0;
+    for (int i = 0; i < probe_count; ++i) {
+        const float* p = probe_xyz + i * 3;
+        if (pointInCudaFrustum(cam.view, cam.proj, p[0], p[1], p[2])) ++score;
+    }
+    return score;
+}
+
+void mulMat4Point4(const Mat4& M, const double in[4], double out[4]) {
+    for (int r = 0; r < 4; ++r) {
+        double s = 0.0;
+        for (int c = 0; c < 4; ++c) {
+            s += M(r, c) * in[c];
+        }
+        out[r] = s;
+    }
+}
+
+void osgWorldToClip(const Mat4& V, const Mat4& P, double x, double y, double z, double clip[4]) {
+    const double world[4] = {x, y, z, 1.0};
+    double view[4];
+    mulMat4Point4(V, world, view);
+    mulMat4Point4(P, view, clip);
+}
+
+void cudaWorldToClip(const float* view, const float* proj, float x, float y, float z, float clip[4]) {
+    const float v[4] = {x, y, z, 1.f};
+    float t[4] = {};
+    for (int c = 0; c < 4; ++c) {
+        float s = 0.f;
+        for (int r = 0; r < 4; ++r) s += v[r] * view[r * 4 + c];
+        t[c] = s;
+    }
+    for (int c = 0; c < 4; ++c) {
+        float s = 0.f;
+        for (int r = 0; r < 4; ++r) s += t[r] * proj[r * 4 + c];
+        clip[c] = s;
+    }
+}
+
+/// 与 OSG clip=proj*view*world 的 NDC 对齐程度（GL 点云可见时用于选 CUDA 打包）。
+int scoreNdcMatchProbes(const Camera& cam, const Mat4& V, const Mat4& P, const float* probe_xyz,
+                        int probe_count) {
+    if (!probe_xyz || probe_count <= 0) return 0;
+    int score = 0;
+    for (int i = 0; i < probe_count; ++i) {
+        const float* p = probe_xyz + i * 3;
+        double osg_clip[4];
+        float cuda_clip[4];
+        osgWorldToClip(V, P, static_cast<double>(p[0]), static_cast<double>(p[1]),
+                       static_cast<double>(p[2]), osg_clip);
+        cudaWorldToClip(cam.view, cam.proj, p[0], p[1], p[2], cuda_clip);
+        if (osg_clip[3] <= 1e-9 || cuda_clip[3] <= 1e-7f) continue;
+        const double osg_w = osg_clip[3];
+        const float cuda_w = cuda_clip[3];
+        bool ok = true;
+        for (int d = 0; d < 3; ++d) {
+            const double osg_ndc = osg_clip[d] / osg_w;
+            const float cuda_ndc = cuda_clip[d] / cuda_w;
+            if (std::abs(osg_ndc - static_cast<double>(cuda_ndc)) > 0.08) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) ++score;
+    }
+    return score;
+}
+
+void pickOsgMatMode(const OsgScene& osg_scene, const float* probe_xyz, int probe_count, LookAtMats& out,
+                    int& mode_out, bool& proj_mul_pv_out) {
+    const SceneMats scene = sceneFromOsg(osg_scene);
+
+    struct Cand {
+        ViewPack vp;
+        ProjPack pp;
+        bool mul_pv;
+    };
+    const Cand cands[] = {
+        {ViewPack::Gl, ProjPack::GlClip, false},
+        {ViewPack::Inria, ProjPack::GlClip, false},
+        {ViewPack::Inria, ProjPack::InriaVP, false},
+        {ViewPack::Inria, ProjPack::InriaClip, false},
+        {ViewPack::Inria, ProjPack::InriaVP, true},
+        {ViewPack::Gl, ProjPack::InriaVP, false},
+    };
+
+    int best = -1;
+    int best_mode = encodeMode(ViewPack::Gl, ProjPack::GlClip);
+    bool best_mul = false;
+
+    for (const Cand& c : cands) {
+        LookAtMats tmp;
+        applyMode(scene, c.vp, c.pp, c.mul_pv, tmp, true);
+        Camera cam;
+        std::memcpy(cam.view, tmp.view, sizeof(cam.view));
+        std::memcpy(cam.proj, tmp.proj, sizeof(cam.proj));
+        std::memcpy(cam.cam_pos, tmp.cam_pos, sizeof(cam.cam_pos));
+        cam.tan_fovx = tmp.tan_fovx;
+        cam.tan_fovy = tmp.tan_fovy;
+        const int frustum = scoreFrustumProbes(cam, probe_xyz, probe_count);
+        const int ndc = scoreNdcMatchProbes(cam, osg_scene.V, osg_scene.proj_gl, probe_xyz, probe_count);
+        const int score = (frustum > 0) ? frustum : ndc;
+        std::cout << "  CUDA osg mat " << viewName(c.vp) << " + " << projName(c.pp)
+                  << (c.mul_pv ? " (P*V)" : "") << " frustum~" << frustum << " ndc~" << ndc << "/"
+                  << probe_count << "\n";
+        if (score > best) {
+            best = score;
+            best_mode = encodeMode(c.vp, c.pp);
+            best_mul = c.mul_pv;
+        }
+    }
+
+    applyMode(scene, static_cast<ViewPack>(best_mode / 16), static_cast<ProjPack>(best_mode % 16), best_mul,
+              out, true);
+    mode_out = best_mode;
+    proj_mul_pv_out = best_mul;
+    std::cout << "CUDA camera: picked " << viewName(static_cast<ViewPack>(best_mode / 16)) << " + "
+              << projName(static_cast<ProjPack>(best_mode % 16))
+              << (best_mul ? " (P*V)" : "") << " (score " << best << "/" << probe_count << ")\n";
 }
 
 }  // namespace
@@ -473,10 +737,39 @@ void pickMatMode(const double eye[3], const double center[3], const double up[3]
 }
 
 void buildOsgMats(const double view_osg[16], const double proj_osg[16], const double ref_center[3],
-                  LookAtMats& out) {
+                  LookAtMats& out, int* mat_mode_out, const float* probe_xyz, int probe_count) {
     const OsgScene scene = makeOsgScene(view_osg, proj_osg, ref_center);
-    buildOsgCameraGl(scene, out);
+    buildOsgCameraGl(scene, ref_center, probe_xyz, probe_count, out);
+    if (mat_mode_out) *mat_mode_out = defaultMatMode();
+}
+
+Mat4 mat4FromGlslRow(const float row[16]) {
+    Mat4 m;
+    for (int i = 0; i < 16; ++i) {
+        m.m[i] = row[i];
+    }
+    return m;
+}
+
+/// row-major V*P，与 vec4(pos,1)*view*proj 一致。
+void buildClipRowFromGlslRow(const float view_glsl[16], const float proj_glsl[16], float clip_row[16]) {
+    const Mat4 V = mat4FromGlslRow(view_glsl);
+    const Mat4 P = mat4FromGlslRow(proj_glsl);
+    const Mat4 clip = V * P;
+    packRowMajor(clip, clip_row);
 }
 
 }  // namespace internal
+
+void buildCameraFromSsboMeta(const ScreenCacheMetaGpu& meta, Camera& out) {
+    std::memcpy(out.view, meta.view_glsl, sizeof(out.view));
+    std::memcpy(out.proj, meta.proj_glsl, sizeof(out.proj));
+    out.cam_pos[0] = meta.cam_pos_tan[0];
+    out.cam_pos[1] = meta.cam_pos_tan[1];
+    out.cam_pos[2] = meta.cam_pos_tan[2];
+    out.tan_fovx = meta.cam_pos_tan[3];
+    out.tan_fovy =
+        (std::abs(meta.proj_glsl[5]) > 1e-12f) ? (1.0f / std::abs(meta.proj_glsl[5])) : 0.57735026f;
+}
+
 }  // namespace gsplat
