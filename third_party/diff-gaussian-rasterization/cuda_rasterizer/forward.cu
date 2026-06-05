@@ -79,7 +79,8 @@ __device__ float3 computeCov2D(const float3& p_view, float focal_x, float focal_
 		return {0.0f, 0.0f, 0.0f};
 
 	float3 t = p_view;
-	const float z = viewDepthGlRow(p_view);
+	// Clamp depth so Jacobian 1/z does not explode for points grazing the camera plane.
+	const float z = fmaxf(viewDepthGlRow(p_view), 0.1f);
 
 	const float limx = 1.3f * tan_fovx;
 	const float limy = 1.3f * tan_fovy;
@@ -204,6 +205,12 @@ __global__ void preprocessCUDA(int P, int D, int M,
 		if (debug_counts) atomicAdd(&debug_counts[0], 1);
 		return;
 	}
+	const float view_depth = viewDepthGlRow(p_view);
+	if (view_depth < 0.1f)
+	{
+		if (debug_counts) atomicAdd(&debug_counts[0], 1);
+		return;
+	}
 
 	float3 p_orig = { orig_points[3 * idx], orig_points[3 * idx + 1], orig_points[3 * idx + 2] };
 
@@ -223,21 +230,15 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	}
 
 	float3 cov = computeCov2D(p_view, focal_x, focal_y, tan_fovx, tan_fovy, cov3D, viewmatrix);
-	cov.x += 0.15f;
-	cov.z += 0.15f;
+	// Match baseline c9d587e: larger screen-space blur stabilizes tiny eigenvalues.
+	cov.x += 0.3f;
+	cov.z += 0.3f;
+	// Interactive scale_modifier: sqrt gain avoids OOM at high modifier (linear was 266x at mod=8).
+	const float cov_gain = fminf(sqrtf(fmaxf(scale_modifier / 0.03f, 1e-3f)), 16.0f);
+	cov.x *= cov_gain;
+	cov.y *= cov_gain;
+	cov.z *= cov_gain;
 
-	const float det_check = (cov.x * cov.z - cov.y * cov.y);
-	if (det_check == 0.0f)
-	{
-		if (debug_counts) atomicAdd(&debug_counts[1], 1);
-		return;
-	}
-	const float mid = 0.5f * (cov.x + cov.z);
-	const float lambda1 = mid + sqrt(max(0.1f, mid * mid - det_check));
-	const float lambda2 = mid - sqrt(max(0.1f, mid * mid - det_check));
-	const float2 aniso = anisoRadiiFromCov(cov, lambda1, lambda2);
-	const int radius_x = static_cast<int>(aniso.x);
-	const int radius_y = static_cast<int>(aniso.y);
 	float2 point_image = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };
 
 	// Invert covariance (EWA algorithm)
@@ -249,8 +250,16 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	}
 	const float det_inv = 1.f / det;
 	const float3 conic = { cov.z * det_inv, -cov.y * det_inv, cov.x * det_inv };
+
+	// Isotropic 3-sigma tile radius (baseline); int2 stores same rx/ry for duplicateWithKeys.
+	const float mid = 0.5f * (cov.x + cov.z);
+	const float lambda1 = mid + sqrt(max(0.1f, mid * mid - det));
+	const float lambda2 = mid - sqrt(max(0.1f, mid * mid - det));
+	int my_radius = static_cast<int>(ceil(3.f * sqrt(max(lambda1, lambda2))));
+	my_radius = max(my_radius, 1);
+	// A/B: cap disabled to match c9d587e baseline (was min(my_radius, 64)).
 	uint2 rect_min, rect_max;
-	getRect(point_image, radius_x, radius_y, rect_min, rect_max, grid);
+	getRect(point_image, my_radius, rect_min, rect_max, grid);
 	if ((rect_max.x - rect_min.x) * (rect_max.y - rect_min.y) == 0)
 	{
 		// Strategy: if the projected center is on-screen, keep at least one tile.
@@ -288,7 +297,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 
 	// Store some useful helper data for the next steps.
 	depths[idx] = viewDepthGlRow(p_view);
-	radii[idx] = {radius_x, radius_y};
+	radii[idx] = {my_radius, my_radius};
 	points_xy_image[idx] = point_image;
 	// Inverse 2D covariance and opacity neatly pack into one float4
 	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacities[idx] };

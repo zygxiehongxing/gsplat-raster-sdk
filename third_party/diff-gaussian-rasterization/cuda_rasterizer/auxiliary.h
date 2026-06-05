@@ -98,24 +98,32 @@ __forceinline__ __device__ float viewDepthGlRow(float3 t_view)
 {
 	return -t_view.z;
 }
+/// GLSL row-major: vec4(p,1) * M, element M(r,c) at matrix[r*4+c].
 __forceinline__ __device__ float3 transformPoint4x3(const float3& p, const float* matrix)
 {
-	float3 transformed = {
-		matrix[0] * p.x + matrix[1] * p.y + matrix[2] * p.z + matrix[3],
-		matrix[4] * p.x + matrix[5] * p.y + matrix[6] * p.z + matrix[7],
-		matrix[8] * p.x + matrix[9] * p.y + matrix[10] * p.z + matrix[11],
-	};
+	const float v[4] = { p.x, p.y, p.z, 1.0f };
+	float3 transformed = {};
+	for (int c = 0; c < 3; ++c) {
+		float s = 0.0f;
+		for (int r = 0; r < 4; ++r) {
+			s += v[r] * matrix[r * 4 + c];
+		}
+		((float*)&transformed)[c] = s;
+	}
 	return transformed;
 }
 
 __forceinline__ __device__ float4 transformPoint4x4(const float3& p, const float* matrix)
 {
-	float4 transformed = {
-		matrix[0] * p.x + matrix[1] * p.y + matrix[2] * p.z + matrix[3],
-		matrix[4] * p.x + matrix[5] * p.y + matrix[6] * p.z + matrix[7],
-		matrix[8] * p.x + matrix[9] * p.y + matrix[10] * p.z + matrix[11],
-		matrix[12] * p.x + matrix[13] * p.y + matrix[14] * p.z + matrix[15]
-	};
+	const float v[4] = { p.x, p.y, p.z, 1.0f };
+	float4 transformed = {};
+	for (int c = 0; c < 4; ++c) {
+		float s = 0.0f;
+		for (int r = 0; r < 4; ++r) {
+			s += v[r] * matrix[r * 4 + c];
+		}
+		((float*)&transformed)[c] = s;
+	}
 	return transformed;
 }
 
@@ -141,11 +149,15 @@ __forceinline__ __device__ float4 worldToClipRow(const float3& p, const float* v
 
 __forceinline__ __device__ float3 transformVec4x3(const float3& p, const float* matrix)
 {
-	float3 transformed = {
-		matrix[0] * p.x + matrix[1] * p.y + matrix[2] * p.z,
-		matrix[4] * p.x + matrix[5] * p.y + matrix[6] * p.z,
-		matrix[8] * p.x + matrix[9] * p.y + matrix[10] * p.z,
-	};
+	const float v[3] = { p.x, p.y, p.z };
+	float3 transformed = {};
+	for (int c = 0; c < 3; ++c) {
+		float s = 0.0f;
+		for (int r = 0; r < 3; ++r) {
+			s += v[r] * matrix[r * 4 + c];
+		}
+		((float*)&transformed)[c] = s;
+	}
 	return transformed;
 }
 

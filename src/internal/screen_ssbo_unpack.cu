@@ -86,6 +86,10 @@ bool allocScreenSoa(int W, int H, DeviceGaussianBuffers& out) {
     return allocScreenBuffers(W, H, 0, 0, out);
 }
 
+bool allocGaussianListSoa(int count, DeviceGaussianBuffers& out) {
+    return allocScreenBuffers(count, 1, 0, 0, out);
+}
+
 void freeScreenSoa(DeviceGaussianBuffers& out) { freeScreenBuffers(out); }
 
 float screenSsboUnpackScaleMul() {
@@ -95,10 +99,10 @@ float screenSsboUnpackScaleMul() {
         if (env && env[0] != '\0' && env[0] != '0') {
             cached = std::strtof(env, nullptr);
         } else {
-            cached = 0.035f;
+            cached = 1.0f;
         }
         if (cached <= 0.f || !std::isfinite(cached)) {
-            cached = 0.035f;
+            cached = 1.0f;
         }
     }
     return cached;
@@ -111,10 +115,10 @@ float screenSsboUnpackMaxOpacity() {
         if (env && env[0] != '\0') {
             cached = std::strtof(env, nullptr);
         } else {
-            cached = 0.65f;
+            cached = 1.0f;
         }
         if (cached <= 0.f || cached > 1.f || !std::isfinite(cached)) {
-            cached = 0.65f;
+            cached = 1.0f;
         }
     }
     return cached;
@@ -226,12 +230,12 @@ bool cudaRasterTimingEnabled() {
 
 }  // namespace
 
-bool unpackScreenSsboPipeline(const GaussianPixelGpu* d_src, int width, int height,
-                              DeviceGaussianBuffers& out, int& filled_out,
+bool unpackScreenSsboPipeline(const GaussianPixelGpu* d_cells, int capacity, int filled_count,
+                              DeviceGaussianBuffers& out, int& compact_out,
                               uint32_t expected_frame_id, float scale_mul, float max_opacity) {
-    filled_out = 0;
-    if (!d_src || width <= 0 || height <= 0) return false;
-    const int n = width * height;
+    compact_out = 0;
+    if (!d_cells || capacity <= 0 || filled_count <= 0) return false;
+    if (filled_count > capacity) filled_count = capacity;
     const bool time_gpu = cudaRasterTimingEnabled();
     cudaEvent_t ev0 = nullptr;
     cudaEvent_t ev1 = nullptr;
@@ -240,23 +244,24 @@ bool unpackScreenSsboPipeline(const GaussianPixelGpu* d_src, int width, int heig
         cudaEventCreate(&ev1);
         cudaEventRecord(ev0, 0);
     }
-    if (out.count != n) {
+    if (out.count != filled_count) {
         freeScreenSoa(out);
-        if (!allocScreenSoa(width, height, out)) return false;
+        if (!allocGaussianListSoa(filled_count, out)) return false;
     }
-    if (!unpackScreenSsboAoS(d_src, n, out, expected_frame_id, scale_mul, max_opacity)) return false;
+    if (!unpackScreenSsboAoS(d_cells, filled_count, out, expected_frame_id, scale_mul, max_opacity)) {
+        return false;
+    }
     {
         static int log_left = 2;
         if (log_left > 0) {
             --log_left;
-            std::cout << "[CUDA unpack] screen scale_mul=" << scale_mul << " max_opacity=" << max_opacity
+            std::cout << "[CUDA unpack] list scale_mul=" << scale_mul << " max_opacity=" << max_opacity
                       << "\n";
         }
     }
-    filled_out = countFilledScreenSoa(out);
     int compact_count = 0;
     if (!compactScreenSoa(out, compact_count)) return false;
-    filled_out = compact_count;
+    compact_out = compact_count;
     if (time_gpu) {
         cudaEventRecord(ev1, 0);
         cudaEventSynchronize(ev1);
@@ -264,13 +269,13 @@ bool unpackScreenSsboPipeline(const GaussianPixelGpu* d_src, int width, int heig
         cudaEventElapsedTime(&ms, ev0, ev1);
         static int unpack_log_counter = 0;
         if ((unpack_log_counter++ % 30) == 0) {
-            std::cout << "[CUDA unpack] " << width << "x" << height << " cells=" << n
+            std::cout << "[CUDA unpack] capacity=" << capacity << " filled=" << filled_count
                       << " compact=" << compact_count << " gpu_ms=" << ms << "\n";
         }
         cudaEventDestroy(ev0);
         cudaEventDestroy(ev1);
     }
-    return true;
+    return compact_count > 0;
 }
 
 }  // namespace internal

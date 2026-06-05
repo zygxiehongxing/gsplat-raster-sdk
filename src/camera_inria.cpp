@@ -767,9 +767,13 @@ void buildCameraFromSsboMeta(const ScreenCacheMetaGpu& meta, Camera& out) {
     out.cam_pos[0] = meta.cam_pos_tan[0];
     out.cam_pos[1] = meta.cam_pos_tan[1];
     out.cam_pos[2] = meta.cam_pos_tan[2];
-    out.tan_fovx = meta.cam_pos_tan[3];
-    out.tan_fovy =
-        (std::abs(meta.proj_glsl[5]) > 1e-12f) ? (1.0f / std::abs(meta.proj_glsl[5])) : 0.57735026f;
+    if (std::abs(meta.proj_glsl[0]) > 1e-12f && std::abs(meta.proj_glsl[5]) > 1e-12f) {
+        out.tan_fovx = 1.0f / std::abs(meta.proj_glsl[0]);
+        out.tan_fovy = 1.0f / std::abs(meta.proj_glsl[5]);
+    } else {
+        out.tan_fovx = meta.cam_pos_tan[3];
+        out.tan_fovy = 0.57735026f;
+    }
 }
 
 }  // namespace gsplat

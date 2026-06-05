@@ -74,9 +74,9 @@ void resetCudaDevice();
 /// 将 RGB8（行优先）写入 PNG。
 bool writeRgbPng(const std::string& path, int width, int height, const std::vector<uint8_t>& rgb);
 
-/// GL SSBO（AoS 映射指针）→ SDK SoA DeviceGaussianBuffers。
-Status unpackScreenSsboToDevice(const GaussianPixelGpu* d_src, int width, int height,
-                                DeviceGaussianBuffers& out, int& filled_out,
+/// GL SSBO 列表（cells[0..filled)）→ SDK SoA DeviceGaussianBuffers（与全量 PLY 路径一致，默认不缩放/钳 opacity）。
+Status unpackScreenSsboToDevice(const GaussianPixelGpu* d_cells, int capacity, int filled_count,
+                                DeviceGaussianBuffers& out, int& compact_out,
                                 uint32_t expected_frame_id = 0xFFFFFFFFu);
 
 /// 调试图（与 SSBO 同尺寸）：用 Camera.proj（row V*P）将每格 mean 投影到像素并标红。

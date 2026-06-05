@@ -200,8 +200,9 @@ bool CudaRasterEngine::renderCore(int width, int height, const float view[16], c
 
     constexpr int kBlock = 16;
     constexpr uint64_t kMaxEstTiles = 8'000'000ULL;
-    // GL SSBO 屏缓存：尺度已钳位，跳过 tile 预算重试（否则 visible 常被误杀为 0）。
-    constexpr bool kDisableTileBudgetForDiag = true;
+    constexpr int kLargeCloudP = 150000;
+    // SSBO 列表 / 百万级子集：tile 估算常超预算，重试会把 rendered 误杀为 0（截图/预览全黑）。
+    const bool skip_tile_budget = (P > kLargeCloudP);
 
     constexpr bool kInputPrefilteredByGl = false;
     // SSBO-screen path treats current input set as the frame's full source.
@@ -297,17 +298,31 @@ bool CudaRasterEngine::renderCore(int width, int height, const float view[16], c
         last_visible_ = 0;
         int max_r = 0;
         int max_r_idx = -1;
+        int at_cap_64 = 0;
         uint64_t est_tiles = 0;
         for (int i = 0; i < P; ++i) {
             const int r = radii_[static_cast<size_t>(i)];
             if (r <= 0) continue;
             ++last_visible_;
+            if (r >= 64) {
+                ++at_cap_64;
+            }
             if (r > max_r) {
                 max_r = r;
                 max_r_idx = i;
             }
             const int tx = (2 * r + kBlock - 1) / kBlock;
             est_tiles += static_cast<uint64_t>(tx) * static_cast<uint64_t>(tx);
+        }
+        {
+            static int cap_log_left = 5;
+            if (cap_log_left > 0 && last_visible_ > 0) {
+                --cap_log_left;
+                const float pct = 100.f * static_cast<float>(at_cap_64) /
+                                  static_cast<float>(std::max(1, last_visible_));
+                std::cout << "[CUDA raster] radius_at_cap64=" << at_cap_64 << "/" << last_visible_ << " ("
+                          << pct << "%) max_radius=" << max_r << "\n";
+            }
         }
 
         if (max_r_idx >= 0 && max_r > 4096) {
@@ -347,7 +362,7 @@ bool CudaRasterEngine::renderCore(int width, int height, const float view[16], c
             }
         }
 
-        if (!kDisableTileBudgetForDiag && last_visible_ > 0 && (est_tiles > kMaxEstTiles || max_r > 256)) {
+        if (!skip_tile_budget && last_visible_ > 0 && (est_tiles > kMaxEstTiles || max_r > 256)) {
             static int tile_warn_left = 3;
             if (tile_warn_left > 0) {
                 --tile_warn_left;
@@ -355,12 +370,14 @@ bool CudaRasterEngine::renderCore(int width, int height, const float view[16], c
                           << " max_radius=" << max_r << " est_tiles=" << est_tiles
                           << " scale_modifier=" << mod << " -> retry\n";
             }
-            last_visible_ = 0;
-            rendered = 0;
             if (attempt + 1 < 2) {
+                last_visible_ = 0;
+                rendered = 0;
                 mod *= 0.5f;
                 continue;
             }
+            std::cerr << "[CUDA raster] tile budget still high on final attempt; rendering anyway (P="
+                      << P << " est_tiles=" << est_tiles << ")\n";
         }
 
         if (rendered > 0) break;
