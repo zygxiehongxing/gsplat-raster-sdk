@@ -87,6 +87,25 @@ Status Rasterizer::render(const Camera& cam, int width, int height, const Device
     return Status::Ok;
 }
 
+Status Rasterizer::renderDevice(const Camera& cam, int width, int height,
+                                const DeviceGaussianBuffers& gaussians) {
+    if (!isCudaAvailable()) return Status::ErrorNoCuda;
+    if (gaussians.count <= 0) return Status::ErrorNoGaussians;
+    if (width <= 0 || height <= 0) return Status::ErrorInvalidArgs;
+    if (cam.tan_fovx <= 0.f || cam.tan_fovy <= 0.f) return Status::ErrorInvalidArgs;
+    if (!impl_->engine.renderFromDeviceGpuOnly(width, height, cam.view, cam.proj, cam.cam_pos, cam.tan_fovx,
+                                               cam.tan_fovy, gaussians)) {
+        return Status::ErrorRenderFailed;
+    }
+    return Status::Ok;
+}
+
+const float* Rasterizer::deviceRgbPlanar() const { return impl_->engine.deviceRgbPlanar(); }
+
+int Rasterizer::deviceRgbWidth() const { return impl_->engine.deviceRgbWidth(); }
+
+int Rasterizer::deviceRgbHeight() const { return impl_->engine.deviceRgbHeight(); }
+
 Status Rasterizer::renderToPng(const Camera& cam, int width, int height, const DeviceGaussianBuffers& gaussians,
                                const std::string& png_path) {
     std::vector<uint8_t> rgb;

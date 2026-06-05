@@ -118,9 +118,17 @@ public:
     void setSettings(const RenderSettings& s);
     RenderSettings settings() const;
 
-    /// 使用 App 提供的 GPU 子集 + 相机渲染 RGB8（行优先）。
+    /// 使用 App 提供的 GPU 子集 + 相机渲染 RGB8（行优先，含 D2H）。
     Status render(const Camera& cam, int width, int height, const DeviceGaussianBuffers& gaussians,
                   std::vector<uint8_t>& out_rgb);
+
+    /// GPU 光栅，不回读 CPU；结果通过 deviceRgbPlanar() 读取直至下次 render/renderDevice。
+    Status renderDevice(const Camera& cam, int width, int height, const DeviceGaussianBuffers& gaussians);
+
+    /// planar float RGB（CHW），与 Inria 光栅输出布局一致。
+    const float* deviceRgbPlanar() const;
+    int deviceRgbWidth() const;
+    int deviceRgbHeight() const;
 
     Status renderToPng(const Camera& cam, int width, int height, const DeviceGaussianBuffers& gaussians,
                        const std::string& png_path);

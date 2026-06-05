@@ -41,6 +41,49 @@ bool cudaRasterTimingEnabled() {
     return cached != 0;
 }
 
+struct CudaRasterTimingStats {
+    int count = 0;
+    double sum_fwd = 0.;
+    double sum_d2h_radii = 0.;
+    double sum_d2h_out = 0.;
+    double sum_total = 0.;
+    double min_fwd = 1e30;
+    double max_fwd = 0.;
+    double min_total = 1e30;
+    double max_total = 0.;
+    long long sum_P = 0;
+
+    void reset() { *this = CudaRasterTimingStats{}; }
+
+    void record(int P, float fwd_ms, float d2h_radii_ms, float d2h_out_ms) {
+        if (fwd_ms < 0.f || d2h_radii_ms < 0.f || d2h_out_ms < 0.f) return;
+        const double fwd = static_cast<double>(fwd_ms);
+        const double rad = static_cast<double>(d2h_radii_ms);
+        const double out = static_cast<double>(d2h_out_ms);
+        const double total = fwd + rad + out;
+        ++count;
+        sum_fwd += fwd;
+        sum_d2h_radii += rad;
+        sum_d2h_out += out;
+        sum_total += total;
+        sum_P += P;
+        if (fwd < min_fwd) min_fwd = fwd;
+        if (fwd > max_fwd) max_fwd = fwd;
+        if (total < min_total) min_total = total;
+        if (total > max_total) max_total = total;
+    }
+
+    void printSummary() const {
+        if (count <= 0) return;
+        const double inv = 1.0 / static_cast<double>(count);
+        std::cout << "[CUDA raster] stats frames=" << count << " P_avg=" << static_cast<int>(sum_P * inv)
+                  << " fwd_avg=" << (sum_fwd * inv) << " fwd_min=" << min_fwd << " fwd_max=" << max_fwd
+                  << " d2h_radii_avg=" << (sum_d2h_radii * inv) << " d2h_out_avg=" << (sum_d2h_out * inv)
+                  << " total_avg=" << (sum_total * inv) << " total_min=" << min_total
+                  << " total_max=" << max_total << " ms\n";
+    }
+};
+
 float elapsedCudaEventMs(cudaEvent_t start, cudaEvent_t stop) {
     float ms = 0.f;
     if (cudaEventSynchronize(stop) != cudaSuccess) return -1.f;
@@ -120,7 +163,38 @@ bool CudaRasterEngine::renderFromDevice(int width, int height, const float view[
     return renderCore(width, height, view, proj, cam_pos, tan_fovx, tan_fovy, src.count, src.sh_degree,
                       src.sh_coeffs, src.means3D, src.sh_degree > 0 ? src.shs : nullptr,
                       src.sh_degree > 0 ? nullptr : src.colors_precomp, src.opacities, src.scales,
-                      src.rotations, out_rgb);
+                      src.rotations, &out_rgb);
+#endif
+}
+
+bool CudaRasterEngine::renderFromDeviceGpuOnly(int width, int height, const float view[16],
+                                               const float proj[16], const float cam_pos[3], float tan_fovx,
+                                               float tan_fovy, const DeviceGaussianBuffers& src) {
+    if (src.count <= 0 || width <= 0 || height <= 0 || !src.means3D || !src.scales || !src.rotations ||
+        !src.opacities) {
+        return false;
+    }
+#ifndef GSPLAT_CUDA_ENABLED
+    (void)view;
+    (void)proj;
+    (void)cam_pos;
+    (void)tan_fovx;
+    (void)tan_fovy;
+    (void)src;
+    return false;
+#else
+    return renderCore(width, height, view, proj, cam_pos, tan_fovx, tan_fovy, src.count, src.sh_degree,
+                      src.sh_coeffs, src.means3D, src.sh_degree > 0 ? src.shs : nullptr,
+                      src.sh_degree > 0 ? nullptr : src.colors_precomp, src.opacities, src.scales,
+                      src.rotations, nullptr);
+#endif
+}
+
+const float* CudaRasterEngine::deviceRgbPlanar() const {
+#ifdef GSPLAT_CUDA_ENABLED
+    return d_out_color_;
+#else
+    return nullptr;
 #endif
 }
 
@@ -129,7 +203,7 @@ bool CudaRasterEngine::renderCore(int width, int height, const float view[16], c
                                   int M, const float* d_means3D, const float* d_shs,
                                   const float* d_colors_precomp, const float* d_opacities,
                                   const float* d_scales, const float* d_rotations,
-                                  std::vector<uint8_t>& out_rgb) {
+                                  std::vector<uint8_t>* out_rgb) {
 #ifndef GSPLAT_CUDA_ENABLED
     (void)width;
     (void)height;
@@ -229,13 +303,34 @@ bool CudaRasterEngine::renderCore(int width, int height, const float view[16], c
         cudaEventDestroy(ev_d2h1);
     };
     static int timing_log_counter = 0;
-    auto logTimingLine = [&](const char* d2h_out_note) {
+    static CudaRasterTimingStats timing_stats;
+    constexpr int kTimingLogInterval = 30;
+    constexpr int kTimingStatsInterval = 60;
+    auto logTimingLine = [&](float d2h_out_ms, bool include_rendered) {
         if (!time_gpu) return;
-        if ((timing_log_counter++ % 30) != 0) return;
+        const bool log_frame = (timing_log_counter % kTimingLogInterval) == 0;
+        const bool log_stats = (timing_log_counter > 0) && (timing_log_counter % kTimingStatsInterval) == 0;
+        ++timing_log_counter;
+        if (d2h_out_ms >= 0.f) {
+            timing_stats.record(P, last_fwd_ms, last_d2h_radii_ms, d2h_out_ms);
+        }
+        if (log_stats) {
+            timing_stats.printSummary();
+            timing_stats.reset();
+        }
+        if (!log_frame) return;
+        const float total_ms =
+            (last_fwd_ms >= 0.f && last_d2h_radii_ms >= 0.f && d2h_out_ms >= 0.f)
+                ? last_fwd_ms + last_d2h_radii_ms + d2h_out_ms
+                : -1.f;
         std::cout << "[CUDA raster] timing " << W << "x" << H << " P=" << P
                   << " gpu_forward_ms=" << last_fwd_ms << " d2h_radii_ms=" << last_d2h_radii_ms
-                  << " d2h_out_color_ms=" << d2h_out_note << " visible=" << last_visible_
-                  << " rendered=" << rendered << "\n";
+                  << " d2h_out_color_ms=" << d2h_out_ms << " total_ms=" << total_ms
+                  << " visible=" << last_visible_;
+        if (include_rendered) {
+            std::cout << " rendered=" << rendered;
+        }
+        std::cout << "\n";
     };
 
     for (int attempt = 0; attempt < 2; ++attempt) {
@@ -290,7 +385,7 @@ bool CudaRasterEngine::renderCore(int width, int height, const float view[16], c
                 freeDevice();
                 continue;
             }
-            logTimingLine("n/a");
+            logTimingLine(-1.f, true);
             destroyTimingEvents();
             return false;
         }
@@ -409,9 +504,10 @@ bool CudaRasterEngine::renderCore(int width, int height, const float view[16], c
         }
     }
 
-    out_rgb.resize(static_cast<size_t>(W * H * 3));
+    last_device_w_ = W;
+    last_device_h_ = H;
     if (rendered <= 0) {
-        logTimingLine("n/a");
+        logTimingLine(-1.f, true);
         destroyTimingEvents();
         if (P > 0) {
             std::cerr << "[CUDA raster] forward produced no pixels (visible=" << last_visible_
@@ -420,6 +516,15 @@ bool CudaRasterEngine::renderCore(int width, int height, const float view[16], c
         return false;
     }
 
+    if (!out_rgb) {
+        if (time_gpu) {
+            logTimingLine(-1.f, false);
+            destroyTimingEvents();
+        }
+        return cudaOk(cudaDeviceSynchronize(), "sync");
+    }
+
+    out_rgb->resize(static_cast<size_t>(W * H * 3));
     out_color_.resize(out_floats);
     float d2h_out_ms = -1.f;
     if (time_gpu) {
@@ -434,9 +539,7 @@ bool CudaRasterEngine::renderCore(int width, int height, const float view[16], c
     if (time_gpu) {
         cudaEventRecord(ev_d2h1, 0);
         d2h_out_ms = elapsedCudaEventMs(ev_d2h0, ev_d2h1);
-        std::cout << "[CUDA raster] timing " << W << "x" << H << " P=" << P
-                  << " gpu_forward_ms=" << last_fwd_ms << " d2h_radii_ms=" << last_d2h_radii_ms
-                  << " d2h_out_color_ms=" << d2h_out_ms << " visible=" << last_visible_ << "\n";
+        logTimingLine(d2h_out_ms, false);
         destroyTimingEvents();
     }
 
@@ -448,9 +551,9 @@ bool CudaRasterEngine::renderCore(int width, int height, const float view[16], c
             const float r = out_color_[static_cast<size_t>(0 * H * W + src_pix)];
             const float g = out_color_[static_cast<size_t>(1 * H * W + src_pix)];
             const float b = out_color_[static_cast<size_t>(2 * H * W + src_pix)];
-            out_rgb[dst + 0] = static_cast<uint8_t>(clamp01(r) * 255.f + 0.5f);
-            out_rgb[dst + 1] = static_cast<uint8_t>(clamp01(g) * 255.f + 0.5f);
-            out_rgb[dst + 2] = static_cast<uint8_t>(clamp01(b) * 255.f + 0.5f);
+            (*out_rgb)[dst + 0] = static_cast<uint8_t>(clamp01(r) * 255.f + 0.5f);
+            (*out_rgb)[dst + 1] = static_cast<uint8_t>(clamp01(g) * 255.f + 0.5f);
+            (*out_rgb)[dst + 2] = static_cast<uint8_t>(clamp01(b) * 255.f + 0.5f);
         }
     }
     return cudaOk(cudaDeviceSynchronize(), "sync");
